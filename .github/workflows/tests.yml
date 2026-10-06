@@ -39,6 +39,18 @@ jobs:
           path: vendor/prism-acp
           persist-credentials: false
 
+      # And BUILD it. A `file:` dependency on a source repository resolves its
+      # entry point and types from `dist/`, which is generated and gitignored --
+      # so a fresh checkout has the source and nothing to import. Locally this
+      # was already true and invisible, because the sibling tree had been built
+      # by its own gates; here it surfaced as the same "Cannot find module" the
+      # previous fix was supposed to have solved.
+      - name: Build the transport
+        working-directory: vendor/prism-acp
+        run: |
+          npm ci
+          npm run build
+
       - run: npm ci
       - run: npm run typecheck
       - run: npm run build

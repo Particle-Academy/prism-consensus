@@ -202,7 +202,15 @@ function realDriver(options: { cwd: string; resumeSessionId?: string }): SeatDri
             ? {}
             : { resumeSessionId: options.resumeSessionId }),
         },
-        { onUpdate: events.onUpdate, onExit: (code) => events.onExit(code) },
+        {
+          onUpdate: events.onUpdate,
+          // Annotated rather than inferred. It was inferred, until a CI run
+          // could not resolve the module and reported an implicit `any` here as
+          // a SECOND error -- noise that looked like a separate defect while
+          // being a symptom of the first. An explicit type is correct either
+          // way and keeps one cause producing one error.
+          onExit: (code: number | null) => events.onExit(code),
+        },
       );
     },
     start() {
