@@ -33,7 +33,8 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { AgentSeat } from './agents.js';
 import { render } from './conversation.js';
-import { DiscussionLoop } from './loop.js';
+import { SeatSessions } from './harness.js';
+import { AgentPresence, Presences } from './presence.js';
 import { sanitiseName } from './names.js';
 import { HUMAN_RESPONSES, RESPONSE_KEYS, humanResponse } from './responses.js';
 import { Principal, Room, RoomError } from './room.js';
@@ -48,9 +49,10 @@ interface Session {
 interface Live {
   readonly room: Room;
   readonly seats: AgentSeat[];
+  readonly presences: AgentPresence[];
   readonly listeners: Set<ServerResponse>;
-  /** Built lazily, once there is a question and at least one agent to run. */
-  loop: DiscussionLoop | null;
+  /** Per-agent durable state, held by prism-harness. */
+  readonly sessions: SeatSessions;
 }
 
 export interface ServerOptions {
@@ -59,6 +61,12 @@ export interface ServerOptions {
   readonly cwd?: string;
   /** Overridable for tests, so no real agent is spawned. */
   readonly seatFactory?: (participantId: string, name: string, cwd: string) => AgentSeat;
+  /** Where per-agent harness state lives. A temp directory when omitted. */
+  readonly stateDirectory?: string;
+  /** Quiet period before an agent replies. Two seconds unless a test shortens it. */
+  readonly quietMs?: number;
+  /** A frame, request or agent turn that could not be used. */
+  readonly onProtocolError?: (roomId: string, problem: string) => void;
 }
 
 export function createConsensusServer(options: ServerOptions = {}) {
@@ -70,9 +78,25 @@ export function createConsensusServer(options: ServerOptions = {}) {
   const page = readFileSync(fileURLToPath(new URL('../public/index.html', import.meta.url)));
 
   function broadcast(live: Live): void {
-    const payload = JSON.stringify(stateOf(live));
+    sendEvent(live, 'state', stateOf(live));
+  }
+
+  /**
+   * Just the message being written.
+   *
+   * Separate from a full state push because a chunk arrives per token:
+   * sending the whole transcript each time would make a long room quadratic
+   * in its own length, and the browser would spend the conversation
+   * re-rendering what it already has.
+   */
+  function broadcastLive(live: Live): void {
+    sendEvent(live, 'live', { live: live.room.live, floorHeldBy: live.room.floorHeldBy });
+  }
+
+  function sendEvent(live: Live, event: string, payload: unknown): void {
+    const data = JSON.stringify(payload);
     for (const listener of live.listeners) {
-      listener.write(`data: ${payload}\n\n`);
+      listener.write(`event: ${event}\ndata: ${data}\n\n`);
     }
   }
 
@@ -87,7 +111,13 @@ export function createConsensusServer(options: ServerOptions = {}) {
       // The six the human may pick, sent to the client so the buttons and the
       // server cannot disagree about what exists.
       responses: Object.entries(HUMAN_RESPONSES).map(([key, r]) => ({ key, label: r.label })),
-      loop: live.loop?.state ?? { running: false, stopping: false, round: 0, lastError: null },
+      // What is being written right now, so a surface can render a message
+      // that is not finished. Null when the room is quiet -- which is "nobody
+      // is speaking", not "there is no message".
+      live: live.room.live,
+      floorHeldBy: live.room.floorHeldBy,
+      presences: new Presences(live.presences).states,
+      running: new Presences(live.presences).running,
     };
   }
 
@@ -143,7 +173,13 @@ export function createConsensusServer(options: ServerOptions = {}) {
       const participantId = 'human';
       room.join({ id: participantId, kind: 'human', name: sanitiseName(body.name, 'You') });
 
-      const live: Live = { room, seats: [], listeners: new Set(), loop: null };
+      const live: Live = {
+        room,
+        seats: [],
+        presences: [],
+        listeners: new Set(),
+        sessions: new SeatSessions(roomId, options.stateDirectory === undefined ? {} : { directory: options.stateDirectory }),
+      };
       rooms.set(roomId, live);
 
       // 32 random bytes. Guessing one is the only way to impersonate the human
@@ -178,7 +214,7 @@ export function createConsensusServer(options: ServerOptions = {}) {
         connection: 'keep-alive',
       });
       live.listeners.add(res);
-      res.write(`data: ${JSON.stringify(stateOf(live))}\n\n`);
+      res.write(`event: state\ndata: ${JSON.stringify(stateOf(live))}\n\n`);
       req.on('close', () => live.listeners.delete(res));
       return;
     }
@@ -206,7 +242,27 @@ export function createConsensusServer(options: ServerOptions = {}) {
           options.seatFactory ??
           ((participantId, agentName, at) =>
             new AgentSeat({ id: participantId, kind: 'agent', name: agentName }, { cwd: at }));
-        live.seats.push(factory(id, name, cwd));
+        const seat = factory(id, name, cwd);
+        live.seats.push(seat);
+
+        // Rehydrated from the harness BEFORE the agent can speak, so an agent
+        // in a restarted room resumes its own CLI conversation instead of
+        // starting a fresh one while the transcript implies continuity.
+        const remembered = await live.sessions.read(id);
+        if (remembered.cliSessionId !== null) seat.resumeFrom(remembered.cliSessionId);
+
+        live.presences.push(
+          new AgentPresence(seat, live.room, {
+            ...(options.quietMs === undefined ? {} : { quietMs: options.quietMs }),
+            onChange: () => broadcast(live),
+            onChunk: () => broadcastLive(live),
+            onError: (participantId, problem) =>
+              options.onProtocolError?.(live.room.id, `${participantId}: ${problem}`),
+            onSpoke: (participantId, cliSessionId, spoke) => {
+              void live.sessions.write(participantId, { cliSessionId, spoke });
+            },
+          }),
+        );
         break;
       }
 
@@ -232,22 +288,21 @@ export function createConsensusServer(options: ServerOptions = {}) {
 
       case 'go': {
         if (live.room.question === null) throw new HttpError(400, 'seed the question first');
-        if (live.seats.length === 0) throw new HttpError(400, 'add an agent first');
+        if (live.presences.length === 0) throw new HttpError(400, 'add an agent first');
 
-        live.loop ??= new DiscussionLoop(live.room, live.seats, {
-          onChange: () => broadcast(live),
-        });
-        // Idempotent in the loop itself, so a double-click cannot start two
-        // loops and double every agent's turns along with the bill.
-        live.loop.start();
+        // Each agent starts its OWN loop. Nothing schedules them and nothing
+        // counts rounds: they watch the room and decide when to speak.
+        // Idempotent per agent, so a double-click cannot start a second loop
+        // for one agent and double its turns along with the bill.
+        new Presences(live.presences).start();
         break;
       }
 
       case 'stop':
-        // Awaited, so the response means it HAS stopped rather than that the
-        // request was heard. A Stop that returns while agents are still running
-        // is the button the human presses again.
-        await live.loop?.stop();
+        // Awaited, so the response means every agent HAS stopped rather than
+        // that the request was heard. A Stop that returns while agents are
+        // still writing is the button the human presses again.
+        await new Presences(live.presences).stop();
         break;
 
       default:
@@ -272,7 +327,9 @@ export function createConsensusServer(options: ServerOptions = {}) {
       // Loops first: a running loop spawns agent processes, and closing the
       // socket while one is mid-round would leave real children behind with
       // nothing listening to them.
-      await Promise.all([...rooms.values()].map(async (live) => await live.loop?.stop()));
+      await Promise.all(
+        [...rooms.values()].map(async (live) => await new Presences(live.presences).stop()),
+      );
       return await new Promise<void>((resolve) => {
         for (const live of rooms.values()) {
           for (const listener of live.listeners) listener.end();

@@ -20,21 +20,31 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const here = dirname(dirname(fileURLToPath(import.meta.url)));
-const target = resolve(here, '..', 'prism-acp-ts');
-const link = join(here, 'vendor', 'prism-acp');
 
-if (!existsSync(join(target, 'package.json'))) {
-  console.error(`no prism-acp-ts working tree at ${target}`);
-  console.error('Clone it beside this repo, or let CI check it out into vendor/prism-acp.');
-  process.exit(1);
+// Both packages this app dogfoods. The harness holds per-agent session state;
+// the transport drives the agents.
+const PACKAGES = [
+  { repo: 'prism-acp-ts', at: 'prism-acp' },
+  { repo: 'prism-harness-ts', at: 'prism-harness' },
+];
+
+for (const { repo, at } of PACKAGES) {
+  const target = resolve(here, '..', repo);
+  const link = join(here, 'vendor', at);
+
+  if (!existsSync(join(target, 'package.json'))) {
+    console.error(`no ${repo} working tree at ${target}`);
+    console.error(`Clone it beside this repo, or let CI check it out into vendor/${at}.`);
+    process.exit(1);
+  }
+
+  mkdirSync(dirname(link), { recursive: true });
+  if (existsSync(link) || isBrokenLink(link)) rmSync(link, { recursive: true, force: true });
+
+  // 'junction' on Windows, which needs no elevated privileges; 'dir' elsewhere.
+  symlinkSync(target, link, process.platform === 'win32' ? 'junction' : 'dir');
+  console.log(`vendor/${at} -> ${target}`);
 }
-
-mkdirSync(dirname(link), { recursive: true });
-if (existsSync(link) || isBrokenLink(link)) rmSync(link, { recursive: true, force: true });
-
-// 'junction' on Windows, which needs no elevated privileges; 'dir' elsewhere.
-symlinkSync(target, link, process.platform === 'win32' ? 'junction' : 'dir');
-console.log(`vendor/prism-acp -> ${target}`);
 
 function isBrokenLink(path) {
   try {

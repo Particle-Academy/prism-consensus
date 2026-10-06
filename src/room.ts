@@ -187,6 +187,19 @@ export interface ConsensusState {
   readonly tally: Tally;
 }
 
+/**
+ * The message somebody is writing right now.
+ *
+ * A chat room shows a reply as it arrives, so a message exists before it is
+ * finished. `text` grows; `at` is when it started.
+ */
+export interface LiveMessage {
+  readonly participantId: string;
+  text: string;
+  readonly kind: Message['kind'];
+  readonly at: number;
+}
+
 export class RoomError extends Error {}
 
 export class Room {
@@ -195,6 +208,8 @@ export class Room {
   question: string | null = null;
 
   readonly #participants = new Map<string, Participant>();
+  #live: LiveMessage | null = null;
+  #lastPostedAt = 0;
   readonly #votes = new Map<string, Vote>();
   readonly #messages: Message[] = [];
 
@@ -212,6 +227,31 @@ export class Room {
 
   get votes(): readonly Vote[] {
     return [...this.#votes.values()];
+  }
+
+  /** What is being written right now, if anything. A copy, so a reader cannot grow it. */
+  get live(): LiveMessage | null {
+    return this.#live === null ? null : { ...this.#live };
+  }
+
+  /**
+   * Who holds the floor, or null.
+   *
+   * ONE speaker at a time, which is not a limitation borrowed from rounds -- it
+   * is what a chat room is. Several agents writing at once produces interleaved
+   * half-sentences that no participant can read, and agents that cannot read
+   * each other stop having a discussion and start talking past one another.
+   *
+   * Each agent decides for itself whether to wait, so the loops stay
+   * independent: the floor is a fact they observe, not a turn they are handed.
+   */
+  get floorHeldBy(): string | null {
+    return this.#live?.participantId ?? null;
+  }
+
+  /** When the last message was COMMITTED, for the quiet period agents observe. */
+  get lastPostedAt(): number {
+    return this.#lastPostedAt;
   }
 
   join(participant: Participant): void {
@@ -263,7 +303,74 @@ export class Room {
     // even by accident.
     const message: Message = { participantId: by.participantId, text, at: Date.now(), kind };
     this.#messages.push(message);
+    this.#lastPostedAt = message.at;
     return message;
+  }
+
+  /**
+   * Take the floor and start writing.
+   *
+   * Refused when somebody else holds it. Attribution comes from the Principal
+   * as everywhere else, so there is no parameter by which one participant could
+   * begin a message as another.
+   */
+  beginSpeaking(by: Principal, kind: Message['kind'] = 'message'): void {
+    this.#requireMember(by);
+    if (this.#live !== null && this.#live.participantId !== by.participantId) {
+      throw new RoomError(`${this.#live.participantId} is already speaking`);
+    }
+    this.#live = { participantId: by.participantId, text: '', kind, at: Date.now() };
+  }
+
+  /**
+   * Add to what you are writing.
+   *
+   * Only the floor holder may, and that is the security property: without it
+   * any participant could append to another's live message and the words would
+   * be committed under their name.
+   */
+  appendSpeech(by: Principal, text: string): void {
+    this.#requireMember(by);
+    if (this.#live === null || this.#live.participantId !== by.participantId) {
+      throw new RoomError(`${by.participantId} does not hold the floor`);
+    }
+    this.#live.text += text;
+  }
+
+  /**
+   * Commit what you wrote and release the floor.
+   *
+   * Returns null for an empty message rather than committing a blank line: an
+   * agent that produced no text said nothing, and a transcript of empty
+   * attributions is worse than a shorter one.
+   */
+  finishSpeaking(by: Principal, finalText?: string): Message | null {
+    this.#requireMember(by);
+    if (this.#live === null || this.#live.participantId !== by.participantId) {
+      throw new RoomError(`${by.participantId} does not hold the floor`);
+    }
+    const { text, kind } = this.#live;
+    this.#live = null;
+
+    // `finalText` exists so a caller can commit something slightly different
+    // from what streamed -- the vote line is stripped before the message is
+    // kept, so the transcript reads as speech rather than as a tally. Doing it
+    // by abandoning and re-posting would make the message visibly vanish and
+    // reappear in a surface that is watching it being written.
+    const committed = (finalText ?? text).trim();
+    return committed.length === 0 ? null : this.say(by, committed, kind);
+  }
+
+  /**
+   * Drop what you were writing and release the floor.
+   *
+   * Used when a turn is cancelled or fails. Nothing is committed, for the same
+   * reason an aborted turn records nothing: half a sentence attributed to
+   * somebody is words they did not finish saying.
+   */
+  abandonSpeech(by: Principal): void {
+    this.#requireMember(by);
+    if (this.#live?.participantId === by.participantId) this.#live = null;
   }
 
   /**

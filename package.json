@@ -16,7 +16,8 @@
     "link:acp": "node tools/link-acp.mjs"
   },
   "dependencies": {
-    "@particle-academy/prism-acp": "file:vendor/prism-acp"
+    "@particle-academy/prism-acp": "file:vendor/prism-acp",
+    "@particle-academy/prism-harness": "file:vendor/prism-harness"
   },
   "devDependencies": {
     "@types/node": "^26.3.0",

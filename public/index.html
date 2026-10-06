@@ -83,6 +83,26 @@
       .msg .text { white-space: pre-wrap; }
       .msg.thought { color: var(--muted); font-style: italic; font-size: 14px; }
       .msg.thought .text::before { content: 'thinking — '; font-style: normal; font-size: 12px; text-transform: uppercase; letter-spacing: 0.05em; }
+      .msg.live .text::after {
+        content: '';
+        display: inline-block;
+        width: 7px;
+        height: 1.05em;
+        margin-left: 2px;
+        background: currentColor;
+        vertical-align: text-bottom;
+        animation: blink 1.05s steps(2, start) infinite;
+      }
+      @keyframes blink { to { opacity: 0; } }
+      .seats { display: flex; gap: 6px; flex-wrap: wrap; margin: 0 0 10px; }
+      .seat {
+        font-size: 12px;
+        padding: 2px 9px;
+        border-radius: 999px;
+        border: 1px solid var(--line);
+        color: var(--muted);
+      }
+      .seat.speaking { color: var(--agent); border-color: currentColor; font-weight: 600; }
       .pill {
         display: inline-block;
         font-size: 12px;
@@ -154,7 +174,9 @@
 
       <section id="talk" hidden>
         <h2>Discussion</h2>
+        <div class="seats" id="seats"></div>
         <div id="transcript"><p class="sub" style="margin: 0">Nobody has spoken yet.</p></div>
+        <div id="liveRow" hidden class="msg live"></div>
         <div style="margin-top: 12px">
           <label for="say">Say something</label>
           <textarea id="say" placeholder="What matters most here is…"></textarea>
@@ -165,9 +187,11 @@
             <button id="stop" class="ghost" hidden>Stop</button>
           </div>
           <p class="sub" style="margin: 8px 0 0">
-            Go runs rounds until you press Stop. Nothing else stops it &mdash; not
-            agreement, not every agent having voted. Each round is one real turn
-            per agent on your subscription, so the round number is shown.
+            Go and each agent starts talking on its own. They answer each other,
+            one at a time, waiting two seconds after anything is said before
+            replying &mdash; so you can interject and they will take it into
+            account. They keep going until you press Stop, and nothing else stops
+            them. Every message is real usage on your subscription.
           </p>
         </div>
         <p class="err" id="talkErr"></p>
@@ -206,7 +230,12 @@
         return data;
       }
 
+      // Kept from the last full state, so a `live` event -- which carries only
+      // the message -- can still name who is writing.
+      let lastParticipants = new Map();
+
       function show(state) {
+        lastParticipants = new Map(state.participants.map((p) => [p.id, p]));
         for (const id of ['roster', 'questionBox', 'talk', 'result']) $(id).hidden = false;
         $('voteBox').hidden = state.question === null;
 
@@ -305,17 +334,65 @@
           );
         }
 
-        const loop = state.loop;
-        $('go').hidden = loop.running;
-        $('stop').hidden = !loop.running;
-        $('stop').disabled = loop.stopping;
-        $('stop').textContent = loop.stopping ? 'Stopping…' : 'Stop';
-        $('loopState').textContent = loop.running
-          ? `${loop.stopping ? 'stopping after' : 'running —'} round ${loop.round}`
-          : loop.round > 0
-            ? `stopped after ${loop.round} round${loop.round === 1 ? '' : 's'}`
+        // Per-agent presence, not a round counter. Each pill says what that
+        // agent is doing, because with independent loops there is no single
+        // thing the room is "on".
+        const byId = new Map(state.participants.map((p) => [p.id, p]));
+        $('seats').replaceChildren(
+          ...state.presences.map((p) => {
+            const el = document.createElement('span');
+            const who = byId.get(p.participantId);
+            el.className = `seat ${p.doing === 'speaking' ? 'speaking' : ''}`;
+            el.textContent = `${who ? who.name : p.participantId} · ${
+              !p.running ? 'idle' : p.doing === 'speaking' ? 'writing…' : 'listening'
+            }${p.spoke > 0 ? ` · ${p.spoke}` : ''}`;
+            if (p.lastError) el.title = p.lastError;
+            return el;
+          }),
+        );
+
+        $('go').hidden = state.running;
+        $('stop').hidden = !state.running;
+        $('loopState').textContent = state.running
+          ? 'in conversation'
+          : state.presences.some((p) => p.spoke > 0)
+            ? 'stopped'
             : '';
-        if (loop.lastError) $('talkErr').textContent = `every agent failed: ${loop.lastError}`;
+
+        const failing = state.presences.filter((p) => p.lastError);
+        if (failing.length === state.presences.length && failing.length > 0) {
+          $('talkErr').textContent = `every agent is failing: ${failing[0].lastError}`;
+        }
+
+        showLive(state);
+      }
+
+      /**
+       * The message being written right now.
+       *
+       * Rendered OUTSIDE the transcript so a token arriving does not re-render
+       * the whole conversation -- and so it can be replaced wholesale when the
+       * message commits and reappears as a normal line.
+       */
+      function showLive(partial) {
+        const live = partial.live;
+        if (!live) {
+          $('liveRow').hidden = true;
+          $('liveRow').replaceChildren();
+          return;
+        }
+        const who = lastParticipants.get(live.participantId);
+        $('liveRow').hidden = false;
+        $('liveRow').className = `msg live ${live.kind}`;
+        const name = document.createElement('span');
+        name.className = `who ${who ? who.kind : 'agent'}`;
+        name.textContent = `${who ? who.name : live.participantId} `;
+        const text = document.createElement('span');
+        text.className = 'text';
+        // textContent, never innerHTML: this is an agent's output arriving a
+        // token at a time.
+        text.textContent = live.text;
+        $('liveRow').replaceChildren(name, text);
       }
 
       function span(text, className) {
@@ -327,7 +404,11 @@
 
       function stream() {
         const source = new EventSource(`/api/rooms/${roomId}/events`);
-        source.onmessage = (event) => show(JSON.parse(event.data));
+        // Two kinds, because they cost different amounts. `state` is the whole
+        // room and arrives when something structural changes; `live` is just
+        // the message being typed and arrives per token.
+        source.addEventListener('state', (event) => show(JSON.parse(event.data)));
+        source.addEventListener('live', (event) => showLive(JSON.parse(event.data)));
       }
 
       async function guard(el, fn) {

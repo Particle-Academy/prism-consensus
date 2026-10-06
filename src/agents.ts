@@ -87,6 +87,18 @@ export class AgentSeat {
   }
 
   /**
+   * Restore the CLI session id this seat should resume from.
+   *
+   * Called when a room is rebuilt and the harness remembers what this agent was
+   * talking to. Refuses to overwrite a live id: a seat mid-conversation being
+   * handed an older one would resume the wrong thread, which does not error --
+   * it just produces an agent that has forgotten the last few minutes.
+   */
+  resumeFrom(cliSessionId: string): void {
+    if (this.#cliSessionId === null) this.#cliSessionId = cliSessionId;
+  }
+
+  /**
    * Run one turn: prompt, collect, parse. Records nothing — see {@link applyTurn}.
    *
    * An aborted turn resolves with an `error` and NO vote, which is the same
@@ -94,7 +106,11 @@ export class AgentSeat {
    * halfway is not a contribution, and recording half of one would put words in
    * an agent's mouth that it had not finished saying.
    */
-  async takeTurn(room: Room, signal?: AbortSignal): Promise<TurnResult> {
+  async takeTurn(
+    room: Room,
+    signal?: AbortSignal,
+    onChunk?: (text: string) => void,
+  ): Promise<TurnResult> {
     const prompt = promptFor(room, this.participant);
     const said: string[] = [];
     const thought: string[] = [];
@@ -122,7 +138,13 @@ export class AgentSeat {
       driver.on({
         onUpdate: (update) => {
           if (update.sessionUpdate === 'agent_message_chunk') {
-            said.push(textOf(update));
+            const text = textOf(update);
+            said.push(text);
+            // Handed on as it arrives, which is what makes the room live. The
+            // transport has been emitting these chunks since the driver was
+            // written; the app used to accumulate them and post the finished
+            // reply, throwing the only thing a chat room needs.
+            if (text.length > 0) onChunk?.(text);
           } else if (update.sessionUpdate === 'agent_thought_chunk') {
             thought.push(textOf(update));
           }

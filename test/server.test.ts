@@ -32,7 +32,7 @@ let app: ReturnType<typeof createConsensusServer>;
 let base: string;
 
 beforeEach(async () => {
-  app = createConsensusServer({ cwd: process.cwd(), seatFactory: fakeSeat });
+  app = createConsensusServer({ cwd: process.cwd(), seatFactory: fakeSeat, quietMs: 20 });
   const port = await app.listen(0);
   base = `http://127.0.0.1:${String(port)}`;
 });
@@ -245,59 +245,95 @@ describe('Go and Stop', () => {
     expect(String(res.body.error)).toMatch(/add an agent/);
   });
 
-  it('runs rounds until Stop, and only Stop', async () => {
-    // The instruction: nothing else stops it -- not agreement, not every agent
-    // having voted. So this lets it run past the point where a
-    // halt-on-consensus implementation would have stopped, then stops it.
+  it('starts a loop PER AGENT, with no rounds anywhere', async () => {
+    // Each agent lives independently. There is no round counter to assert
+    // because there are no rounds -- what the state carries is one presence per
+    // agent, each saying what it is doing.
     const client = await openRoom();
     await post(client, 'agents', { name: 'Ada' });
+    await post(client, 'agents', { name: 'Bob' });
     await post(client, 'question', { question: 'Adopt ACP?' });
 
     const go = await post(client, 'go');
     expect(go.status).toBe(200);
-    expect((go.body.loop as { running: boolean }).running).toBe(true);
 
-    // Wait for more than one round, which proves it did not stop after the
-    // first -- and the agent agrees every time, so a halt-on-agreement loop
-    // would have ended at round 1.
-    for (let waited = 0; waited < 100; waited++) {
+    const presences = go.body.presences as Array<{ participantId: string; running: boolean }>;
+    expect(presences.map((p) => p.participantId).sort()).toEqual(['agent_1', 'agent_2']);
+    expect(presences.every((p) => p.running)).toBe(true);
+    expect(go.body).not.toHaveProperty('loop');
+
+    await post(client, 'stop');
+  }, 30_000);
+
+  it('agents speak without being asked, and keep answering each other', async () => {
+    // TWO agents, because one is the wrong test and the first version of this
+    // used one and failed. A lone agent speaks once and then correctly waits:
+    // "nothing new since I last spoke" is the rule that stops agents filling a
+    // transcript with restatements. It takes a second participant for there to
+    // be anything to answer.
+    const client = await openRoom();
+    await post(client, 'agents', { name: 'Ada' });
+    await post(client, 'agents', { name: 'Bob' });
+    await post(client, 'question', { question: 'Adopt ACP?' });
+    await post(client, 'go');
+
+    // Four messages means the exchange went past one each: nothing between
+    // them asked anybody to speak again.
+    for (let waited = 0; waited < 300; waited++) {
       const res = await fetch(`${base}/api/rooms/${client.roomId}`, {
         headers: { cookie: client.cookie },
       });
-      const state = (await res.json()) as { loop: { round: number } };
-      if (state.loop.round >= 2) break;
-      await new Promise((resolve) => setTimeout(resolve, 100));
+      const state = (await res.json()) as { transcript: unknown[] };
+      if (state.transcript.length >= 4) break;
+      await new Promise((resolve) => setTimeout(resolve, 50));
     }
 
     const stopped = await post(client, 'stop');
-    const loop = stopped.body.loop as { running: boolean; round: number };
-    expect(loop.running).toBe(false);
-    expect(loop.round).toBeGreaterThanOrEqual(2);
+    expect((stopped.body.transcript as unknown[]).length).toBeGreaterThanOrEqual(4);
+    const spoke = (stopped.body.presences as Array<{ spoke: number }>).map((p) => p.spoke);
+    expect(spoke.every((n) => n >= 1)).toBe(true);
   }, 30_000);
 
-  it('Stop means it HAS stopped when the request returns', async () => {
-    // A Stop that returns while agents are still running is the button a human
-    // presses again.
+  it('a LONE agent speaks once and then waits, rather than restating itself', async () => {
+    // The other half of the same rule, asserted so it cannot quietly become a
+    // chatterbox: with nobody to answer, an agent that kept going would burn
+    // the human's subscription to add no information.
     const client = await openRoom();
     await post(client, 'agents', { name: 'Ada' });
     await post(client, 'question', { question: 'Adopt ACP?' });
     await post(client, 'go');
+
+    await new Promise((resolve) => setTimeout(resolve, 1200));
     const stopped = await post(client, 'stop');
-    expect((stopped.body.loop as { running: boolean; stopping: boolean })).toMatchObject({
-      running: false,
-      stopping: false,
-    });
+
+    expect((stopped.body.presences as Array<{ spoke: number }>)[0]?.spoke).toBe(1);
   }, 30_000);
 
-  it('Go twice does not start two loops', async () => {
-    // Which would double every agent's turns and the bill with them.
+  it('Stop means every agent HAS stopped when the request returns', async () => {
+    const client = await openRoom();
+    await post(client, 'agents', { name: 'Ada' });
+    await post(client, 'agents', { name: 'Bob' });
+    await post(client, 'question', { question: 'Adopt ACP?' });
+    await post(client, 'go');
+
+    const stopped = await post(client, 'stop');
+    const presences = stopped.body.presences as Array<{ running: boolean }>;
+    expect(presences.every((p) => !p.running)).toBe(true);
+    expect(stopped.body.running).toBe(false);
+    // And the floor is released, or the room would look permanently busy.
+    expect(stopped.body.floorHeldBy).toBeNull();
+  }, 30_000);
+
+  it('Go twice does not start a second loop per agent', async () => {
     const client = await openRoom();
     await post(client, 'agents', { name: 'Ada' });
     await post(client, 'question', { question: 'Adopt ACP?' });
     await post(client, 'go');
     const again = await post(client, 'go');
+
     expect(again.status).toBe(200);
-    expect((again.body.loop as { running: boolean }).running).toBe(true);
+    const presences = again.body.presences as Array<{ participantId: string }>;
+    expect(presences).toHaveLength(1);
     await post(client, 'stop');
   }, 30_000);
 
@@ -306,19 +342,42 @@ describe('Go and Stop', () => {
     expect((await post(client, 'stop')).status).toBe(200);
   });
 
-  it('records each vote as the loop produces it', async () => {
+  it('only ONE agent holds the floor at a time', async () => {
+    // Several agents streaming at once produces interleaved half-sentences
+    // nobody can read. The floor is observed by each agent, not handed out.
+    const client = await openRoom();
+    for (const name of ['Ada', 'Bob', 'Cal']) await post(client, 'agents', { name });
+    await post(client, 'question', { question: 'Adopt ACP?' });
+    await post(client, 'go');
+
+    for (let sampled = 0; sampled < 40; sampled++) {
+      const res = await fetch(`${base}/api/rooms/${client.roomId}`, {
+        headers: { cookie: client.cookie },
+      });
+      const state = (await res.json()) as {
+        presences: Array<{ doing: string }>;
+        floorHeldBy: string | null;
+      };
+      expect(state.presences.filter((p) => p.doing === 'speaking').length).toBeLessThanOrEqual(1);
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+
+    await post(client, 'stop');
+  }, 30_000);
+
+  it('records the votes agents cast as they speak', async () => {
     const client = await openRoom();
     await post(client, 'agents', { name: 'Ada' });
     await post(client, 'question', { question: 'Adopt ACP?' });
     await post(client, 'go');
 
-    for (let waited = 0; waited < 100; waited++) {
+    for (let waited = 0; waited < 200; waited++) {
       const res = await fetch(`${base}/api/rooms/${client.roomId}`, {
         headers: { cookie: client.cookie },
       });
       const state = (await res.json()) as { votes: unknown[] };
       if (state.votes.length > 0) break;
-      await new Promise((resolve) => setTimeout(resolve, 100));
+      await new Promise((resolve) => setTimeout(resolve, 50));
     }
 
     const stopped = await post(client, 'stop');
@@ -327,7 +386,6 @@ describe('Go and Stop', () => {
   }, 30_000);
 
   it('stays UNDECIDED while the human has not responded', async () => {
-    // agreed: null, not false. The agents agreeing is not the room deciding.
     const client = await openRoom();
     await post(client, 'agents', { name: 'Ada' });
     await post(client, 'question', { question: 'Adopt ACP?' });
@@ -381,10 +439,12 @@ describe('the live stream', () => {
     const reader = res.body?.getReader();
     const chunk = await reader?.read();
     const text = new TextDecoder().decode(chunk?.value);
-    expect(text).toContain('data: ');
-    expect(JSON.parse(text.replace(/^data: /, '').trim())).toMatchObject({
-      question: 'Adopt ACP?',
-    });
+
+    // Named events, because a chunk of streamed text is not a state snapshot
+    // and a client should not have to guess which it received.
+    expect(text).toContain('event: state');
+    const data = text.split('data: ')[1] ?? '';
+    expect(JSON.parse(data.trim())).toMatchObject({ question: 'Adopt ACP?' });
     await reader?.cancel();
   });
 
