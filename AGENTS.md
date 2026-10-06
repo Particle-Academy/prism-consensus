@@ -40,6 +40,60 @@ work" but **"can anyone else do it as them?"** The answers that matter:
   mechanism. G-36 is the precedent: it fell to a single trailing space in three
   languages at once.
 
+## Go stops for nothing but Stop
+
+`DiscussionLoop` runs rounds until the human stops it. Not until consensus, not
+until everyone has voted, not until a round changes nothing — a room that
+halted on first agreement would hide whether agreement SURVIVES discussion.
+
+Two bounds exist and neither is a disguised stop: a short pause between rounds,
+which is what makes Stop land in a second rather than at the mercy of a turn;
+and a backoff after a round in which EVERY agent failed, because spinning on
+failure is not discussion. One failing agent among several is a normal round.
+
+**Stop kills in-flight turns rather than draining them.** Draining a room of
+several agents is tens of seconds of paid work after the human asked it to end,
+and a Stop button that takes half a minute reads as broken, which invites a
+second press. An aborted turn records NOTHING — half a contribution would put
+words in an agent's mouth it had not finished saying — and an aborted round is
+not counted, because counting it would claim work that was cancelled.
+
+`stop()` is awaited, so the HTTP response means it has stopped rather than that
+the request was heard.
+
+## The human's six responses are a closed set
+
+`src/responses.ts` is the only place they exist, and a request names a KEY.
+There is no path by which a human-supplied string reaches an agent's prompt: the
+reason text an agent sees is this table's. An unknown key is REFUSED, never
+defaulted — defaulting to `accept` would turn a typo into agreement.
+
+`pass` is human-only, enforced in `castVote` against the Principal's kind. It is
+the strongest single move in the room: it removes a third of the weight and
+renormalises the agents to the whole vote, so an agent able to pass could hand
+itself the decision.
+
+## The weighting, and what follows from it
+
+The human is worth `HUMAN_WEIGHT` = 1/3 always; agents share 2/3 equally. Alone
+in a room the human holds the whole vote, because reporting a third of a
+one-person room is a true fraction and a false description.
+
+`agreed` is now a WEIGHTED comparison — `agreeWeight > disagreeWeight` — which
+reverses two things this app used to do, both covered by tests that say so:
+
+- two agents CAN outvote the human two-to-one;
+- a single dissent no longer blocks.
+
+`unanimous` is reported separately for that reason. Folding it into `agreed`
+would hide the dissent the room exists to surface. If a lone dissent should
+block again, that is one condition — `disagreeWeight === 0` — and it is a
+product decision, not a bug.
+
+`perAgent` is 0, never Infinity, when there are no agents: dividing by zero
+would poison every weighted sum with NaN, and NaN comparisons are all false, so
+the room would silently never agree.
+
 ## Absence is a value, and the two cases differ
 
 **`null` means "cannot tell"; `false` means "no".** `consensus().agreed` stays

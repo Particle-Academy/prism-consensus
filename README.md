@@ -9,8 +9,59 @@ key and no third-party adapter.
 npm ci && npm start     # http://127.0.0.1:8099
 ```
 
-Open a room, add a couple of agents, seed a question, run a round. The agents
-argue, everyone votes, and the room tells you whether it agreed.
+Open a room, add a couple of agents, seed a question, press **Go**. The agents
+discuss in rounds and keep going until you press **Stop**.
+
+**Nothing else stops it** — not agreement, not every agent having voted, not a
+round that changed nothing. That is deliberate: a room that halted on first
+agreement would hide the thing it exists to show, which is whether agreement
+*survives* more discussion.
+
+Every round is one real turn per agent on your subscription, so the round number
+is on screen. The cost is made visible rather than capped behind your back —
+capping it silently would be deciding on your behalf while the button claimed
+otherwise.
+
+## Your response is one of six
+
+You do not type a vote or a reason. You pick:
+
+| | means | weight effect |
+|---|---|---|
+| **Accept** | agree | your third counts for |
+| **Reject: Too Long** | disagree | your third counts against |
+| **Reject: Not Clear** | disagree | — |
+| **Reject: Wrong Direction** | disagree | — |
+| **Pass: Agents Decide** | pass | your third is **removed** |
+| **Pass: Not Interested** | pass | your third is **removed** |
+
+A closed set is a product decision and a security one. Every other string that
+reaches an agent's prompt is untrusted input; these six are not strings from a
+request at all — a request names a key, and the text an agent sees is this app's
+own. The rejection reasons are about the *proposal* rather than the
+participants, because a room of agents can act on "too long" and cannot act on
+"no".
+
+## Your vote is worth one third
+
+Always a third, however many agents are in the room; they share the other two
+thirds equally. With five agents you still hold a third where one-vote-each
+would have left you a sixth.
+
+Two consequences, both asserted by tests rather than left implicit:
+
+- **Two agents can outvote you two-to-one.** That follows from the weighting,
+  and it is the exact objection an agent raised unprompted in the first live
+  run: *"a majority rule would let agents overrule the person the decision is
+  for."*
+- **A single dissent no longer blocks.** The decision is a weighted comparison,
+  so you-plus-one-agent beats one dissenting agent. The dissent is not hidden —
+  `unanimous` is reported separately, because once the vote is weighted
+  "agreed" stops meaning "nobody objected" and both facts matter.
+
+**Passing** removes your third and renormalises the agents to the whole vote.
+That is what makes it different from abstaining, which parks a third on neither
+side and can make agreement impossible to reach.
 
 ## What it is actually for
 

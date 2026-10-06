@@ -40,7 +40,18 @@ export interface Participant {
   readonly name: string;
 }
 
-export type VoteChoice = 'agree' | 'disagree' | 'abstain';
+/**
+ * `pass` is HUMAN-ONLY, and it is not the same as `abstain`.
+ *
+ * - `abstain` — "I have voted, and my weight counts for neither side."
+ * - `pass` — "hand this to the agents": the human's weight is REMOVED and the
+ *   agents' share is renormalised to the whole vote.
+ *
+ * Collapsing them would lose a real distinction. Abstaining keeps a third of
+ * the weight parked on neither side, which can make agreement impossible to
+ * reach; passing takes it off the table so the agents can actually decide.
+ */
+export type VoteChoice = 'agree' | 'disagree' | 'abstain' | 'pass';
 
 export interface Vote {
   readonly participantId: string;
@@ -110,12 +121,45 @@ export class Principal {
   }
 }
 
+/**
+ * How much each participant's vote is worth.
+ *
+ * **The human is always worth exactly one third**, however many agents are in
+ * the room, and the agents share the remaining two thirds equally. "Always" is
+ * the point: with five agents the human still holds a third, where a
+ * one-vote-each room would have left them with a sixth.
+ *
+ * A consequence worth seeing rather than discovering: two agents at a third
+ * each CAN outvote the human two-to-one. That is what this weighting means, and
+ * it is the exact objection one agent raised unprompted in the first live run —
+ * "a majority rule would let agents overrule the person the decision is for".
+ * The weights are reported in the tally so the arithmetic is visible instead of
+ * implied.
+ *
+ * When the human passes, their third is removed and the agents renormalise to
+ * the whole vote.
+ */
+export interface Weights {
+  readonly human: number;
+  readonly perAgent: number;
+}
+
+/** The human's fixed share. */
+export const HUMAN_WEIGHT = 1 / 3;
+
 export interface Tally {
   readonly agree: number;
   readonly disagree: number;
   readonly abstain: number;
+  /** Weighted sums, which are what the decision is made on. */
+  readonly agreeWeight: number;
+  readonly disagreeWeight: number;
+  readonly abstainWeight: number;
   /** Participants who have not voted yet. */
   readonly outstanding: readonly string[];
+  /** True once the human has handed the decision to the agents. */
+  readonly humanPassed: boolean;
+  readonly weights: Weights;
 }
 
 export interface ConsensusState {
@@ -128,6 +172,16 @@ export interface ConsensusState {
    * consensus" has made a claim the room has not made.
    */
   readonly agreed: boolean | null;
+  /**
+   * Whether anybody dissented at all, reported SEPARATELY from `agreed`.
+   *
+   * Once the vote is weighted, `agreed` is a weighted decision and no longer
+   * means "everyone was happy". Both facts matter and they can differ: a room
+   * can agree on weight while one participant disagreed outright. Folding them
+   * into one boolean would hide the dissent that the room is supposed to make
+   * visible.
+   */
+  readonly unanimous: boolean | null;
   readonly tally: Tally;
 }
 
@@ -210,6 +264,15 @@ export class Room {
       throw new RoomError('nobody can vote before the question is seeded');
     }
 
+    // `pass` is the human's alone, and it is the strongest single move in the
+    // room: it removes a third of the weight and renormalises the agents to the
+    // whole vote. An agent able to pass could hand itself the decision, which
+    // is the same defect as an agent casting the human's vote wearing a
+    // different name.
+    if (choice === 'pass' && by.kind !== 'human') {
+      throw new RoomError('only the human may pass');
+    }
+
     const existing = this.#votes.get(by.participantId);
     if (existing !== undefined) {
       // Changing a vote is legitimate -- a discussion is supposed to move
@@ -223,31 +286,84 @@ export class Room {
     return vote;
   }
 
+  /**
+   * What each participant's vote is worth right now.
+   *
+   * The human holds {@link HUMAN_WEIGHT} and the agents share the rest. If the
+   * human has passed, their share is removed and the agents renormalise to the
+   * whole vote — which is what passing means.
+   *
+   * A room with no agents gives the human everything rather than leaving two
+   * thirds unassigned, because an unassigned share would make agreement
+   * arithmetically impossible in a room where the only participant agreed.
+   */
+  weights(): Weights {
+    const agents = this.participants.filter((p) => p.kind === 'agent').length;
+    const humanPresent = this.participants.some((p) => p.kind === 'human');
+    const passed = this.votes.some((v) => v.choice === 'pass');
+
+    // A third only when there is somebody to share the rest with. Alone, the
+    // human holds the whole vote: leaving two thirds unassigned would report
+    // that they hold a third of a room they are the only member of, which is
+    // a true fraction and a false description.
+    const human = !humanPresent || passed ? 0 : agents === 0 ? 1 : HUMAN_WEIGHT;
+    const agentShare = 1 - human;
+
+    return {
+      human,
+      // Zero rather than Infinity when there are no agents: dividing by zero
+      // here would poison every weighted sum with NaN, and NaN comparisons are
+      // all false, so the room would silently never agree.
+      perAgent: agents === 0 ? 0 : agentShare / agents,
+    };
+  }
+
   consensus(): ConsensusState {
     const voted = new Set(this.#votes.keys());
-    const outstanding = this.participants
-      .map((p) => p.id)
-      .filter((id) => !voted.has(id));
+    const outstanding = this.participants.map((p) => p.id).filter((id) => !voted.has(id));
+    const weights = this.weights();
+    const kindOf = new Map(this.participants.map((p) => [p.id, p.kind]));
+
+    const weightOf = (participantId: string): number =>
+      kindOf.get(participantId) === 'human' ? weights.human : weights.perAgent;
+
+    const sum = (choice: VoteChoice): number =>
+      this.votes
+        .filter((v) => v.choice === choice)
+        .reduce((total, v) => total + weightOf(v.participantId), 0);
 
     const tally: Tally = {
       agree: this.votes.filter((v) => v.choice === 'agree').length,
       disagree: this.votes.filter((v) => v.choice === 'disagree').length,
       abstain: this.votes.filter((v) => v.choice === 'abstain').length,
+      agreeWeight: sum('agree'),
+      disagreeWeight: sum('disagree'),
+      abstainWeight: sum('abstain'),
       outstanding,
+      humanPassed: this.votes.some((v) => v.choice === 'pass'),
+      weights,
     };
 
     // `agreed` stays null until everyone has voted, because an incomplete room
     // has not decided anything. Reporting false early would read as "the room
-    // disagreed", which is a different and untrue claim.
+    // disagreed", which is a different and untrue claim. A passing human HAS
+    // voted -- passing is a decision about who decides, not a silence.
     if (outstanding.length > 0 || this.#participants.size === 0) {
-      return { reached: false, agreed: null, tally };
+      return { reached: false, agreed: null, unanimous: null, tally };
     }
 
-    // Consensus means nobody dissented. An abstention is not a dissent, but it
-    // is not an agreement either -- so a room of all abstentions reaches a
-    // decision of `false`, not `true`.
-    const agreed = tally.disagree === 0 && tally.agree > 0;
-    return { reached: true, agreed, tally };
+    // The decision is made on WEIGHT, which is what weighting the human's vote
+    // means. An abstention sits on neither side, so a room of all abstentions
+    // reaches a decision of `false` rather than `true`: "nobody objected" is
+    // not "everybody agreed", and reading silence as assent is how a room
+    // agrees to something nobody chose.
+    const agreed = tally.agreeWeight > tally.disagreeWeight;
+
+    // Reported separately, because once the vote is weighted `agreed` no longer
+    // implies nobody dissented -- and the dissent is the thing worth seeing.
+    const unanimous = tally.disagree === 0 && tally.agree > 0;
+
+    return { reached: true, agreed, unanimous, tally };
   }
 
   #requireMember(principal: Principal): void {

@@ -56,6 +56,14 @@ export interface SeatDriver {
   start(): void;
   prompt(text: string): void;
   endInput(): void;
+  /**
+   * End the turn now.
+   *
+   * Required for Stop to mean stop. Without it the only honest Stop is "finish
+   * the round first", which on a room of several agents is tens of seconds of
+   * paid work after the human asked for it to end.
+   */
+  kill(): void;
   readonly cliSessionId: string | null;
   on(events: {
     onUpdate: (update: AcpUpdate) => void;
@@ -78,8 +86,15 @@ export class AgentSeat {
     return this.#cliSessionId;
   }
 
-  /** Run one turn: prompt, collect, parse. Records nothing — see {@link applyTurn}. */
-  async takeTurn(room: Room): Promise<TurnResult> {
+  /**
+   * Run one turn: prompt, collect, parse. Records nothing — see {@link applyTurn}.
+   *
+   * An aborted turn resolves with an `error` and NO vote, which is the same
+   * shape as a crashed one. That is deliberate: a turn the human cancelled
+   * halfway is not a contribution, and recording half of one would put words in
+   * an agent's mouth that it had not finished saying.
+   */
+  async takeTurn(room: Room, signal?: AbortSignal): Promise<TurnResult> {
     const prompt = promptFor(room, this.participant);
     const said: string[] = [];
     const thought: string[] = [];
@@ -90,7 +105,20 @@ export class AgentSeat {
       ...(this.#cliSessionId === null ? {} : { resumeSessionId: this.#cliSessionId }),
     });
 
+    if (signal?.aborted === true) {
+      return {
+        participantId: this.participant.id,
+        text: '',
+        thought: '',
+        vote: null,
+        error: 'stopped before this turn started',
+      };
+    }
+
     const code = await new Promise<number | null>((resolve) => {
+      const onAbort = () => driver.kill();
+      signal?.addEventListener('abort', onAbort, { once: true });
+
       driver.on({
         onUpdate: (update) => {
           if (update.sessionUpdate === 'agent_message_chunk') {
@@ -99,7 +127,10 @@ export class AgentSeat {
             thought.push(textOf(update));
           }
         },
-        onExit: resolve,
+        onExit: (code) => {
+          signal?.removeEventListener('abort', onAbort);
+          resolve(code);
+        },
       });
       driver.start();
       driver.prompt(prompt);
@@ -155,10 +186,13 @@ export function applyTurn(room: Room, seat: AgentSeat, result: TurnResult): void
 export async function runRound(
   room: Room,
   seats: readonly AgentSeat[],
+  signal?: AbortSignal,
 ): Promise<readonly TurnResult[]> {
   // allSettled, not all: one agent failing must not cost the round. A rejected
   // promise here would discard the turns that succeeded alongside it.
-  const settled = await Promise.allSettled(seats.map(async (seat) => await seat.takeTurn(room)));
+  const settled = await Promise.allSettled(
+    seats.map(async (seat) => await seat.takeTurn(room, signal)),
+  );
 
   const results: TurnResult[] = [];
   for (const [index, outcome] of settled.entries()) {
@@ -221,6 +255,9 @@ function realDriver(options: { cwd: string; resumeSessionId?: string }): SeatDri
     },
     endInput() {
       driver?.endInput();
+    },
+    kill() {
+      driver?.kill();
     },
     get cliSessionId() {
       return driver?.cliSessionId ?? null;

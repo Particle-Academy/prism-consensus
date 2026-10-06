@@ -159,30 +159,35 @@
           <label for="say">Say something</label>
           <textarea id="say" placeholder="What matters most here is…"></textarea>
           <div class="row" style="margin-top: 8px">
-            <span></span>
+            <span id="loopState" class="sub" style="flex: 1 1 auto; margin: 0"></span>
             <button id="sayBtn" class="ghost">Send</button>
-            <button id="round">Run a round</button>
+            <button id="go">Go</button>
+            <button id="stop" class="ghost" hidden>Stop</button>
           </div>
+          <p class="sub" style="margin: 8px 0 0">
+            Go runs rounds until you press Stop. Nothing else stops it &mdash; not
+            agreement, not every agent having voted. Each round is one real turn
+            per agent on your subscription, so the round number is shown.
+          </p>
         </div>
         <p class="err" id="talkErr"></p>
       </section>
 
       <section id="voteBox" hidden>
-        <h2>Your vote</h2>
-        <label for="reason">Why (optional)</label>
-        <input id="reason" type="text" placeholder="because the ports already prove it" />
-        <div class="row" style="margin-top: 8px">
-          <span></span>
-          <button data-choice="agree">Agree</button>
-          <button data-choice="disagree" class="ghost">Disagree</button>
-          <button data-choice="abstain" class="ghost">Abstain</button>
-        </div>
+        <h2>Your response</h2>
+        <p class="sub" style="margin: 0 0 10px">
+          Your vote is worth a third of the room, however many agents are in it. The
+          agents share the other two thirds. Passing removes your third and lets them
+          decide outright.
+        </p>
+        <div class="row" id="responses"></div>
       </section>
 
       <section id="result" hidden>
         <h2>Consensus</h2>
         <p class="verdict" id="verdict"></p>
         <p class="sub" id="tally" style="margin: 0"></p>
+        <p class="sub" id="weights" style="margin: 4px 0 0"></p>
       </section>
     </main>
 
@@ -224,7 +229,7 @@
             // No vote is shown as "not yet", never as a dash: a dash reads as a
             // value and this is an absence.
             pill.className = `pill ${vote ? vote.choice : ''}`;
-            pill.textContent = vote ? vote.choice : 'not yet';
+            pill.textContent = vote ? (vote.choice === 'pass' ? 'passed' : vote.choice) : 'not yet';
             choice.append(pill);
             const why = document.createElement('td');
             why.textContent = vote?.reason ?? '';
@@ -259,19 +264,65 @@
         }
 
         const c = state.consensus;
+        const t = c.tally;
+
         if (c.agreed === null) {
-          $('verdict').innerHTML = '<span class="unknown">Not decided yet</span>';
+          // "Not decided yet" and "No agreement" are different facts. Rendering
+          // the first as the second would claim the room decided against.
+          $('verdict').replaceChildren(span('Not decided yet', 'unknown'));
+          $('verdict').style.color = '';
         } else {
           $('verdict').textContent = c.agreed ? 'Agreed' : 'No agreement';
           $('verdict').style.color = c.agreed ? 'var(--agree-ok)' : 'var(--no)';
         }
-        const t = c.tally;
-        $('tally').textContent =
-          `${t.agree} agree · ${t.disagree} disagree · ${t.abstain} abstain` +
-          (t.outstanding.length > 0 ? ` · waiting on ${t.outstanding.length}` : '');
 
-        $('round').disabled = state.running;
-        $('round').textContent = state.running ? 'Round running…' : 'Run a round';
+        const pct = (w) => `${Math.round(w * 100)}%`;
+        $('tally').textContent =
+          `${pct(t.agreeWeight)} agree · ${pct(t.disagreeWeight)} disagree` +
+          (t.abstainWeight > 0 ? ` · ${pct(t.abstainWeight)} abstain` : '') +
+          (t.outstanding.length > 0 ? ` · waiting on ${t.outstanding.length}` : '') +
+          (c.unanimous === false ? ' · not unanimous' : '');
+
+        $('weights').textContent = t.humanPassed
+          ? `You passed, so the agents hold the whole vote (${pct(t.weights.perAgent)} each).`
+          : `You hold ${pct(t.weights.human)}; each agent holds ${pct(t.weights.perAgent)}.`;
+
+        // Six fixed buttons, built from what the server says exists, so the
+        // page and the server cannot disagree about the options.
+        if ($('responses').childElementCount !== state.responses.length) {
+          $('responses').replaceChildren(
+            ...state.responses.map((r) => {
+              const button = document.createElement('button');
+              button.textContent = r.label;
+              button.className = r.key === 'accept' ? '' : 'ghost';
+              button.addEventListener('click', () =>
+                guard($('talkErr'), async () => {
+                  show(await api(`/api/rooms/${roomId}/vote`, { response: r.key }));
+                }),
+              );
+              return button;
+            }),
+          );
+        }
+
+        const loop = state.loop;
+        $('go').hidden = loop.running;
+        $('stop').hidden = !loop.running;
+        $('stop').disabled = loop.stopping;
+        $('stop').textContent = loop.stopping ? 'Stopping…' : 'Stop';
+        $('loopState').textContent = loop.running
+          ? `${loop.stopping ? 'stopping after' : 'running —'} round ${loop.round}`
+          : loop.round > 0
+            ? `stopped after ${loop.round} round${loop.round === 1 ? '' : 's'}`
+            : '';
+        if (loop.lastError) $('talkErr').textContent = `every agent failed: ${loop.lastError}`;
+      }
+
+      function span(text, className) {
+        const el = document.createElement('span');
+        el.className = className;
+        el.textContent = text;
+        return el;
       }
 
       function stream() {
@@ -318,24 +369,19 @@
         }),
       );
 
-      $('round').addEventListener('click', () =>
+      $('go').addEventListener('click', () =>
         guard($('talkErr'), async () => {
-          show(await api(`/api/rooms/${roomId}/round`, {}));
+          show(await api(`/api/rooms/${roomId}/go`, {}));
         }),
       );
 
-      for (const button of document.querySelectorAll('[data-choice]')) {
-        button.addEventListener('click', () =>
-          guard($('talkErr'), async () => {
-            show(
-              await api(`/api/rooms/${roomId}/vote`, {
-                choice: button.dataset.choice,
-                reason: $('reason').value,
-              }),
-            );
-          }),
-        );
-      }
+      $('stop').addEventListener('click', () =>
+        guard($('talkErr'), async () => {
+          // The request does not return until the loop has actually stopped, so
+          // the button reads "Stopping…" rather than appearing to do nothing.
+          show(await api(`/api/rooms/${roomId}/stop`, {}));
+        }),
+      );
     </script>
   </body>
 </html>

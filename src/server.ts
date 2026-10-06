@@ -31,8 +31,10 @@ import { randomBytes } from 'node:crypto';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { AgentSeat, runRound } from './agents.js';
+import { AgentSeat } from './agents.js';
 import { render } from './conversation.js';
+import { DiscussionLoop } from './loop.js';
+import { HUMAN_RESPONSES, RESPONSE_KEYS, humanResponse } from './responses.js';
 import { Principal, Room, RoomError } from './room.js';
 
 const COOKIE = 'consensus_token';
@@ -46,8 +48,8 @@ interface Live {
   readonly room: Room;
   readonly seats: AgentSeat[];
   readonly listeners: Set<ServerResponse>;
-  /** True while a round is running, so two cannot overlap. */
-  running: boolean;
+  /** Built lazily, once there is a question and at least one agent to run. */
+  loop: DiscussionLoop | null;
 }
 
 export interface ServerOptions {
@@ -81,7 +83,10 @@ export function createConsensusServer(options: ServerOptions = {}) {
       transcript: render(live.room),
       votes: live.room.votes,
       consensus: live.room.consensus(),
-      running: live.running,
+      // The six the human may pick, sent to the client so the buttons and the
+      // server cannot disagree about what exists.
+      responses: Object.entries(HUMAN_RESPONSES).map(([key, r]) => ({ key, label: r.label })),
+      loop: live.loop?.state ?? { running: false, stopping: false, round: 0, lastError: null },
     };
   }
 
@@ -137,7 +142,7 @@ export function createConsensusServer(options: ServerOptions = {}) {
       const participantId = 'human';
       room.join({ id: participantId, kind: 'human', name: nameOf(body.name, 'You') });
 
-      const live: Live = { room, seats: [], listeners: new Set(), running: false };
+      const live: Live = { room, seats: [], listeners: new Set(), loop: null };
       rooms.set(roomId, live);
 
       // 32 random bytes. Guessing one is the only way to impersonate the human
@@ -212,27 +217,37 @@ export function createConsensusServer(options: ServerOptions = {}) {
         live.room.say(who, String(body.text ?? ''));
         break;
 
-      case 'vote':
-        live.room.castVote(who, choiceOf(body.choice), reasonOf(body.reason));
+      case 'vote': {
+        // The human picks one of six; they do not supply a choice or a reason.
+        // A free-text reason would be untrusted input on its way into an
+        // agent's prompt, and there is no need for one.
+        const response = humanResponse(body.response);
+        if (response === null) {
+          throw new HttpError(400, `response must be one of: ${RESPONSE_KEYS.join(', ')}`);
+        }
+        live.room.castVote(who, response.choice, response.reason);
         break;
+      }
 
-      case 'round': {
-        if (live.running) throw new HttpError(409, 'a round is already running');
+      case 'go': {
         if (live.room.question === null) throw new HttpError(400, 'seed the question first');
         if (live.seats.length === 0) throw new HttpError(400, 'add an agent first');
 
-        live.running = true;
-        broadcast(live);
-        try {
-          await runRound(live.room, live.seats);
-        } finally {
-          // Cleared in `finally`: a round that threw must not leave the room
-          // permanently "running", which would lock out every later round with
-          // a 409 and look like the app hanging.
-          live.running = false;
-        }
+        live.loop ??= new DiscussionLoop(live.room, live.seats, {
+          onChange: () => broadcast(live),
+        });
+        // Idempotent in the loop itself, so a double-click cannot start two
+        // loops and double every agent's turns along with the bill.
+        live.loop.start();
         break;
       }
+
+      case 'stop':
+        // Awaited, so the response means it HAS stopped rather than that the
+        // request was heard. A Stop that returns while agents are still running
+        // is the button the human presses again.
+        await live.loop?.stop();
+        break;
 
       default:
         send(res, 404, { error: 'not found' });
@@ -252,13 +267,18 @@ export function createConsensusServer(options: ServerOptions = {}) {
           resolve(typeof address === 'object' && address !== null ? address.port : port);
         });
       }),
-    close: () =>
-      new Promise<void>((resolve) => {
+    close: async () => {
+      // Loops first: a running loop spawns agent processes, and closing the
+      // socket while one is mid-round would leave real children behind with
+      // nothing listening to them.
+      await Promise.all([...rooms.values()].map(async (live) => await live.loop?.stop()));
+      return await new Promise<void>((resolve) => {
         for (const live of rooms.values()) {
           for (const listener of live.listeners) listener.end();
         }
         server.close(() => resolve());
-      }),
+      });
+    },
   };
 }
 
@@ -316,14 +336,3 @@ function nameOf(value: unknown, fallback: string): string {
   return (name.length > 0 ? name : fallback).replace(/[\u0000-\u001F\u007F]/g, '').slice(0, 60);
 }
 
-function choiceOf(value: unknown): 'agree' | 'disagree' | 'abstain' {
-  if (value === 'agree' || value === 'disagree' || value === 'abstain') return value;
-  // Refused rather than defaulted. Defaulting a malformed vote to `agree` is
-  // the one direction that must never happen here.
-  throw new HttpError(400, 'choice must be agree, disagree or abstain');
-}
-
-function reasonOf(value: unknown): string | null {
-  const reason = typeof value === 'string' ? value.trim() : '';
-  return reason.length > 0 ? reason.slice(0, 2000) : null;
-}

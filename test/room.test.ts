@@ -146,13 +146,46 @@ describe('consensus', () => {
     expect(room.consensus()).toMatchObject({ reached: true, agreed: true });
   });
 
-  it('a single dissent blocks consensus', () => {
-    // Consensus, not majority. One participant disagreeing is the whole point
-    // of asking: a 2-1 vote is a disagreement, not an agreement.
+  it('a single dissent NO LONGER blocks, because the vote is weighted', () => {
+    // A deliberate consequence of weighting the human at a third, recorded
+    // because it reverses what this app did before and is easy to assume
+    // otherwise: the decision is now a weighted comparison, so human-agree
+    // (1/3) plus one agent-agree (1/3) beats one agent-disagree (1/3).
+    //
+    // The dissent is not hidden -- `unanimous` reports it separately. Folding
+    // the two into one boolean is what would hide it.
     const room = seeded();
     room.castVote(human(), 'agree');
     room.castVote(agentA(), 'agree');
     room.castVote(agentB(), 'disagree');
+
+    const state = room.consensus();
+    expect(state).toMatchObject({ reached: true, agreed: true, unanimous: false });
+    expect(state.tally.agreeWeight).toBeCloseTo(2 / 3);
+    expect(state.tally.disagreeWeight).toBeCloseTo(1 / 3);
+  });
+
+  it('the agents CAN outvote the human two-to-one', () => {
+    // The arithmetic of a one-third human share, asserted rather than left
+    // implicit. One agent raised exactly this objection unprompted in the first
+    // live run: "a majority rule would let agents overrule the person the
+    // decision is for". With this weighting, it can.
+    const room = seeded();
+    room.castVote(human(), 'disagree');
+    room.castVote(agentA(), 'agree');
+    room.castVote(agentB(), 'agree');
+
+    expect(room.consensus()).toMatchObject({ reached: true, agreed: true, unanimous: false });
+  });
+
+  it('the human alone can block two agents when one of them dissents', () => {
+    // 1/3 disagree from the human plus 1/3 disagree from an agent outweighs a
+    // single 1/3 agreement, so the human is not powerless -- they are one third.
+    const room = seeded();
+    room.castVote(human(), 'disagree');
+    room.castVote(agentA(), 'disagree');
+    room.castVote(agentB(), 'agree');
+
     expect(room.consensus()).toMatchObject({ reached: true, agreed: false });
   });
 
@@ -165,6 +198,86 @@ describe('consensus', () => {
     room.castVote(agentA(), 'abstain');
     room.castVote(agentB(), 'abstain');
     expect(room.consensus()).toMatchObject({ reached: true, agreed: false });
+  });
+
+  it('weights the human at exactly one third, whatever the agent count', () => {
+    // "Always" is the requirement. With five agents a one-vote-each room would
+    // leave the human a sixth; here they keep a third and the five share the
+    // rest.
+    const room = new Room('r1');
+    room.join({ id: 'h1', kind: 'human', name: 'Wish' });
+    for (let n = 1; n <= 5; n++) room.join({ id: `a${n}`, kind: 'agent', name: `A${n}` });
+
+    const weights = room.weights();
+    expect(weights.human).toBeCloseTo(1 / 3);
+    expect(weights.perAgent).toBeCloseTo(2 / 15);
+    // And the shares account for the whole vote, with nothing unassigned.
+    expect(weights.human + weights.perAgent * 5).toBeCloseTo(1);
+  });
+
+  it('gives the human the whole vote when there are no agents', () => {
+    // Zero rather than two thirds unassigned: an unassigned share would make
+    // agreement arithmetically impossible in a room where the only participant
+    // agreed.
+    const room = new Room('r1');
+    room.join({ id: 'h1', kind: 'human', name: 'Wish' });
+    room.seedQuestion(human(), 'Q?');
+    room.castVote(human(), 'agree');
+    expect(room.weights().human).toBeCloseTo(1);
+    expect(room.consensus()).toMatchObject({ reached: true, agreed: true });
+  });
+});
+
+describe('pass — the human hands the decision to the agents', () => {
+  it('removes the human third and renormalises the agents to the whole vote', () => {
+    const room = seeded();
+    room.castVote(human(), 'pass');
+    expect(room.weights().human).toBe(0);
+    expect(room.weights().perAgent).toBeCloseTo(1 / 2);
+  });
+
+  it('counts the human as HAVING voted, so the room can still decide', () => {
+    // Passing is a decision about who decides, not a silence. Leaving the human
+    // outstanding would mean a passed room could never reach a conclusion.
+    const room = seeded();
+    room.castVote(human(), 'pass');
+    room.castVote(agentA(), 'agree');
+    room.castVote(agentB(), 'agree');
+
+    const state = room.consensus();
+    expect(state.tally.outstanding).toEqual([]);
+    expect(state).toMatchObject({ reached: true, agreed: true });
+    expect(state.tally.humanPassed).toBe(true);
+  });
+
+  it('lets a single agent decide a passed room', () => {
+    const room = seeded();
+    room.castVote(human(), 'pass');
+    room.castVote(agentA(), 'agree');
+    room.castVote(agentB(), 'disagree');
+    // Half each once the human's third is removed, so a tie is not an
+    // agreement: agreeWeight must EXCEED disagreeWeight.
+    expect(room.consensus()).toMatchObject({ reached: true, agreed: false });
+  });
+
+  it('is refused for an agent — only the human may pass', () => {
+    // Passing is the strongest single move in the room: it removes a third of
+    // the weight and renormalises the agents to the whole vote. An agent able
+    // to pass could hand itself the decision.
+    const room = seeded();
+    expect(() => room.castVote(agentA(), 'pass')).toThrow(/only the human may pass/);
+  });
+
+  it('differs from abstain, which keeps the weight parked on neither side', () => {
+    // The distinction worth having: abstaining can make agreement impossible,
+    // passing takes the third off the table so the agents can decide.
+    const abstained = seeded();
+    abstained.castVote(human(), 'abstain');
+    expect(abstained.weights().human).toBeCloseTo(1 / 3);
+
+    const passed = seeded();
+    passed.castVote(human(), 'pass');
+    expect(passed.weights().human).toBe(0);
   });
 
   it('counts an abstention as neither agree nor disagree in the tally', () => {
