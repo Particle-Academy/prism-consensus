@@ -38,6 +38,7 @@ import { AgentPresence, Presences } from './presence.js';
 import { sanitiseName } from './names.js';
 import { HUMAN_RESPONSES, RESPONSE_KEYS, humanResponse } from './responses.js';
 import { Principal, Room, RoomError } from './room.js';
+import { RoomStore } from './store.js';
 
 const COOKIE = 'consensus_token';
 
@@ -61,7 +62,13 @@ export interface ServerOptions {
   readonly cwd?: string;
   /** Overridable for tests, so no real agent is spawned. */
   readonly seatFactory?: (participantId: string, name: string, cwd: string) => AgentSeat;
-  /** Where per-agent harness state lives. A temp directory when omitted. */
+  /**
+   * Where per-agent harness state and persisted rooms live.
+   *
+   * Omitted gets a temp directory, which means rooms do NOT survive a restart —
+   * correct for a test, and the caller has to opt in to persistence rather than
+   * discover that a throwaway room outlived the process.
+   */
   readonly stateDirectory?: string;
   /** Quiet period before an agent replies. Two seconds unless a test shortens it. */
   readonly quietMs?: number;
@@ -75,10 +82,114 @@ export function createConsensusServer(options: ServerOptions = {}) {
   const cwd = options.cwd ?? process.cwd();
   let counter = 0;
 
+  // Null when no directory was given: rooms then live only in memory, which is
+  // what a test wants. Persistence is opted into rather than discovered.
+  const store = options.stateDirectory === undefined ? null : new RoomStore(options.stateDirectory);
+
   const page = readFileSync(fileURLToPath(new URL('../public/index.html', import.meta.url)));
+
+  /**
+   * Give a room an agent: a seat, its rehydrated memory, and its own loop.
+   *
+   * Shared by `/agents` and by restore, because a restored room needs this too.
+   * Without it a restored agent would be listed in the roster and be inert --
+   * Go would refuse the room for having no agents while the UI showed three,
+   * which looks like the button is broken rather than the room being empty.
+   */
+  async function seatAgent(live: Live, id: string, name: string): Promise<void> {
+    const factory =
+      options.seatFactory ??
+      ((participantId, agentName, at) =>
+        new AgentSeat({ id: participantId, kind: 'agent', name: agentName }, { cwd: at }));
+
+    const seat = factory(id, name, cwd);
+    live.seats.push(seat);
+
+    // Rehydrated BEFORE the agent can speak, so an agent in a restarted room
+    // resumes its own CLI conversation instead of starting a fresh one while the
+    // transcript implies continuity.
+    const remembered = await live.sessions.read(id);
+    if (remembered.cliSessionId !== null) seat.resumeFrom(remembered.cliSessionId);
+
+    live.presences.push(
+      new AgentPresence(seat, live.room, {
+        ...(options.quietMs === undefined ? {} : { quietMs: options.quietMs }),
+        onChange: () => broadcast(live),
+        onChunk: () => broadcastLive(live),
+        onError: (participantId, problem) =>
+          options.onProtocolError?.(live.room.id, `${participantId}: ${problem}`),
+        onSpoke: (participantId, cliSessionId, spoke) => {
+          void live.sessions.write(participantId, { cliSessionId, spoke });
+        },
+      }),
+    );
+  }
+
+  /** One save in flight per room, with bursts coalesced. See {@link persist}. */
+  const saving = new Map<string, Promise<void>>();
+  const dirty = new Set<string>();
+
+  /**
+   * Save a room, without ever having two writes to it in flight.
+   *
+   * The store writes atomically by writing a temp file and renaming it over the
+   * target. Two concurrent saves of the SAME room therefore race on that
+   * rename, and on Windows the loser gets `EPERM: operation not permitted` --
+   * which is how this was found: three persistence tests failed on a rename,
+   * not on anything about rooms.
+   *
+   * So saves are serialised per room and bursts are coalesced: a change arriving
+   * while a save is running marks the room dirty and the running save goes round
+   * again. That is also the right shape for a chatty room, where several
+   * structural changes can land in the same tick.
+   *
+   * Still not awaited by the caller -- a broadcast must not wait on a disk
+   * write -- so `flush` exists for shutdown, where losing the last message would
+   * be worse than slow.
+   */
+  function persist(live: Live): void {
+    if (store === null) return;
+    const id = live.room.id;
+
+    if (saving.has(id)) {
+      dirty.add(id);
+      return;
+    }
+
+    const run = async (): Promise<void> => {
+      do {
+        dirty.delete(id);
+        await store.saveRoom(live.room.snapshot());
+      } while (dirty.has(id));
+    };
+
+    const inFlight = run()
+      .catch((cause: unknown) => {
+        // Surfaced, not swallowed: a room that has silently stopped persisting
+        // looks identical to one that is persisting.
+        options.onProtocolError?.(id, `could not save the room: ${String(cause)}`);
+      })
+      .finally(() => {
+        saving.delete(id);
+      });
+
+    saving.set(id, inFlight);
+  }
+
+  /** Wait for every in-flight save, then save once more. For shutdown. */
+  async function flush(): Promise<void> {
+    await Promise.all([...saving.values()]);
+    await Promise.all(
+      [...rooms.values()].map(async (live) => await store?.saveRoom(live.room.snapshot())),
+    );
+  }
 
   function broadcast(live: Live): void {
     sendEvent(live, 'state', stateOf(live));
+    // Saved on every structural change rather than on an interval: a room is
+    // small, and an interval would lose whatever happened after the last tick --
+    // exactly the messages a human would notice missing.
+    persist(live);
   }
 
   /**
@@ -127,9 +238,25 @@ export function createConsensusServer(options: ServerOptions = {}) {
    * The ONLY place a human Principal is minted. Everything else takes a
    * Principal as an argument, so there is no second route to one.
    */
-  function human(req: IncomingMessage, roomId: string): { live: Live; who: Principal } {
+  async function human(
+    req: IncomingMessage,
+    roomId: string,
+  ): Promise<{ live: Live; who: Principal }> {
     const token = cookieOf(req.headers.cookie, COOKIE);
-    const session = token === null ? undefined : sessions.get(token);
+    let session = token === null ? undefined : sessions.get(token);
+
+    // A token this PROCESS has not seen may still be valid: after a restart the
+    // browser still holds the cookie and the room is on disk. The store is
+    // consulted by HASH -- it never held the token itself -- and the result is
+    // cached so the lookup happens once.
+    if (session === undefined && token !== null && store !== null) {
+      const stored = await store.readSession(token);
+      if (stored !== null) {
+        session = stored;
+        sessions.set(token, stored);
+      }
+    }
+
     const live = rooms.get(roomId);
 
     if (live === undefined) throw new HttpError(404, 'no such room');
@@ -186,6 +313,17 @@ export function createConsensusServer(options: ServerOptions = {}) {
       // over HTTP, so it is not a counter and not a uuid-v1.
       const token = randomBytes(32).toString('hex');
       sessions.set(token, { roomId, participantId });
+      // Persisted as a HASH, so the file is useless to whoever reads it. Without
+      // this the room would come back after a restart and its human would be
+      // locked out of it, which is worse than not persisting at all.
+      await store?.saveSession(token, { roomId, participantId });
+
+      // And the room itself, which nothing else would have done: creation
+      // answers the request directly rather than going through broadcast, so an
+      // empty room was never written. It came back 404 after a restart while
+      // its cookie was still valid -- which reads as the token being rejected
+      // rather than the room never having been saved.
+      persist(live);
 
       res.writeHead(200, {
         'content-type': 'application/json',
@@ -207,7 +345,7 @@ export function createConsensusServer(options: ServerOptions = {}) {
     const action = match[2];
 
     if (method === 'GET' && action === 'events') {
-      const { live } = human(req, roomId);
+      const { live } = await human(req, roomId);
       res.writeHead(200, {
         'content-type': 'text/event-stream',
         'cache-control': 'no-cache',
@@ -220,7 +358,7 @@ export function createConsensusServer(options: ServerOptions = {}) {
     }
 
     if (method === 'GET' && action === undefined) {
-      const { live } = human(req, roomId);
+      const { live } = await human(req, roomId);
       send(res, 200, stateOf(live));
       return;
     }
@@ -230,7 +368,7 @@ export function createConsensusServer(options: ServerOptions = {}) {
       return;
     }
 
-    const { live, who } = human(req, roomId);
+    const { live, who } = await human(req, roomId);
     const body = await readJson(req);
 
     switch (action) {
@@ -238,31 +376,7 @@ export function createConsensusServer(options: ServerOptions = {}) {
         const name = sanitiseName(body.name, `Agent ${live.seats.length + 1}`);
         const id = `agent_${live.seats.length + 1}`;
         live.room.join({ id, kind: 'agent', name });
-        const factory =
-          options.seatFactory ??
-          ((participantId, agentName, at) =>
-            new AgentSeat({ id: participantId, kind: 'agent', name: agentName }, { cwd: at }));
-        const seat = factory(id, name, cwd);
-        live.seats.push(seat);
-
-        // Rehydrated from the harness BEFORE the agent can speak, so an agent
-        // in a restarted room resumes its own CLI conversation instead of
-        // starting a fresh one while the transcript implies continuity.
-        const remembered = await live.sessions.read(id);
-        if (remembered.cliSessionId !== null) seat.resumeFrom(remembered.cliSessionId);
-
-        live.presences.push(
-          new AgentPresence(seat, live.room, {
-            ...(options.quietMs === undefined ? {} : { quietMs: options.quietMs }),
-            onChange: () => broadcast(live),
-            onChunk: () => broadcastLive(live),
-            onError: (participantId, problem) =>
-              options.onProtocolError?.(live.room.id, `${participantId}: ${problem}`),
-            onSpoke: (participantId, cliSessionId, spoke) => {
-              void live.sessions.write(participantId, { cliSessionId, spoke });
-            },
-          }),
-        );
+        await seatAgent(live, id, name);
         break;
       }
 
@@ -314,15 +428,66 @@ export function createConsensusServer(options: ServerOptions = {}) {
     send(res, 200, stateOf(live));
   }
 
-  return {
+  // Named, because listen() calls restore() on it -- a plain object literal
+  // cannot reference its own sibling.
+  const served = {
     server,
-    listen: async (port = options.port ?? 8099) =>
-      await new Promise<number>((resolve) => {
+    /**
+     * Bring persisted rooms back.
+     *
+     * Exposed separately as well as run by `listen`, so a test can restore
+     * without binding a port.
+     */
+    restore: async (): Promise<number> => {
+      if (store === null) return 0;
+
+      let restored = 0;
+      for (const snapshot of await store.loadRooms()) {
+        if (rooms.has(snapshot.id)) continue;
+
+        const live: Live = {
+          room: Room.restore(snapshot),
+          seats: [],
+          presences: [],
+          listeners: new Set(),
+          sessions: new SeatSessions(
+            snapshot.id,
+            options.stateDirectory === undefined ? {} : { directory: options.stateDirectory },
+          ),
+        };
+
+        // Seats for the agents that were in the room. Without this they come
+        // back in the roster and are inert, and Go refuses a room for having no
+        // agents while the UI lists three.
+        for (const participant of live.room.participants) {
+          if (participant.kind === 'agent') await seatAgent(live, participant.id, participant.name);
+        }
+
+        rooms.set(snapshot.id, live);
+        restored += 1;
+
+        // `counter` names new rooms, and a restored `room_1` would otherwise be
+        // collided with by the next room created. Advanced past anything seen.
+        const n = Number(/^room_(\d+)$/.exec(snapshot.id)?.[1] ?? 0);
+        if (Number.isFinite(n) && n > counter) counter = n;
+      }
+
+      // Nobody is started. A restarted room comes back QUIET: resuming the
+      // conversation without being asked would have agents talking into a room
+      // whose human may not be watching, and spending their subscription to do
+      // it. Go is the human's to press.
+      return restored;
+    },
+
+    listen: async (port = options.port ?? 8099) => {
+      await served.restore();
+      return await new Promise<number>((resolve) => {
         server.listen(port, '127.0.0.1', () => {
           const address = server.address();
           resolve(typeof address === 'object' && address !== null ? address.port : port);
         });
-      }),
+      });
+    },
     close: async () => {
       // Loops first: a running loop spawns agent processes, and closing the
       // socket while one is mid-round would leave real children behind with
@@ -330,6 +495,13 @@ export function createConsensusServer(options: ServerOptions = {}) {
       await Promise.all(
         [...rooms.values()].map(async (live) => await new Presences(live.presences).stop()),
       );
+
+      // FLUSH, awaited. Saves during a session do not block a broadcast, which
+      // means the last one may still be in flight when the process is told to
+      // stop. Without this the final message and vote were lost: a restart that
+      // drops what was just said is worse than no persistence at all, because
+      // it looks like it worked.
+      await flush();
       return await new Promise<void>((resolve) => {
         for (const live of rooms.values()) {
           for (const listener of live.listeners) listener.end();
@@ -338,6 +510,8 @@ export function createConsensusServer(options: ServerOptions = {}) {
       });
     },
   };
+
+  return served;
 }
 
 class HttpError extends Error {

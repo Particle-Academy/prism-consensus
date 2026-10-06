@@ -200,6 +200,15 @@ export interface LiveMessage {
   readonly at: number;
 }
 
+/** A room, flattened for storage. */
+export interface RoomSnapshot {
+  readonly id: string;
+  readonly question: string | null;
+  readonly participants: readonly Participant[];
+  readonly messages: readonly Message[];
+  readonly votes: readonly Vote[];
+}
+
 export class RoomError extends Error {}
 
 export class Room {
@@ -252,6 +261,50 @@ export class Room {
   /** When the last message was COMMITTED, for the quiet period agents observe. */
   get lastPostedAt(): number {
     return this.#lastPostedAt;
+  }
+
+  /**
+   * Everything worth keeping across a restart.
+   *
+   * The LIVE message is deliberately absent, and so is the floor. A message
+   * half-written when the process died is not a message -- restoring one would
+   * attribute words to somebody that they never finished saying, and restoring
+   * a floor holder would leave a room permanently busy waiting for an agent
+   * that no longer exists.
+   */
+  snapshot(): RoomSnapshot {
+    return {
+      id: this.id,
+      question: this.question,
+      participants: this.participants.map((p) => ({ ...p })),
+      messages: this.messages.map((m) => ({ ...m })),
+      votes: this.votes.map((v) => ({ ...v })),
+    };
+  }
+
+  /**
+   * Rebuild a room from a snapshot.
+   *
+   * This bypasses `join`, `say` and `castVote` -- it is replaying state those
+   * methods already validated, not accepting new input, and re-validating would
+   * reject a legitimately restored room whose human now collides with an agent
+   * added before the rule existed.
+   *
+   * It therefore TRUSTS THE STORE, and that is the boundary worth naming: the
+   * snapshot comes from this app's own file under the user's own account, never
+   * from a request. If a snapshot ever arrives over a wire, this is the function
+   * that needs a validator in front of it.
+   */
+  static restore(snapshot: RoomSnapshot): Room {
+    const room = new Room(snapshot.id);
+    room.question = snapshot.question;
+    for (const participant of snapshot.participants) {
+      room.#participants.set(participant.id, participant);
+    }
+    for (const message of snapshot.messages) room.#messages.push(message);
+    for (const vote of snapshot.votes) room.#votes.set(vote.participantId, vote);
+    room.#lastPostedAt = snapshot.messages.at(-1)?.at ?? 0;
+    return room;
   }
 
   join(participant: Participant): void {
