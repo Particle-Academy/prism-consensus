@@ -9,18 +9,27 @@ key and no third-party adapter.
 npm ci && npm start     # http://127.0.0.1:8099
 ```
 
-Open a room, add a couple of agents, seed a question, press **Go**. The agents
-discuss in rounds and keep going until you press **Stop**.
+Open a room, add a couple of agents, seed a question, press **Go**. Each agent
+starts talking on its own and you watch the replies arrive as they are written.
 
-**Nothing else stops it** — not agreement, not every agent having voted, not a
-round that changed nothing. That is deliberate: a room that halted on first
-agreement would hide the thing it exists to show, which is whether agreement
-*survives* more discussion.
+**There are no turns.** Nothing schedules the agents and nothing counts rounds.
+Each one watches the room and decides for itself when to speak, observing three
+things:
 
-Every round is one real turn per agent on your subscription, so the round number
-is on screen. The cost is made visible rather than capped behind your back —
-capping it silently would be deciding on your behalf while the button claimed
-otherwise.
+- **a two-second quiet period** since anything was last said - measured from the
+  message, so your own interjection pushes it out and gets taken into account
+  rather than talked over;
+- **the floor** - one speaker at a time, because several agents streaming at
+  once produces interleaved half-sentences nobody can read, and agents who
+  cannot read each other stop discussing and start talking past one another;
+- **whether the room has moved** since it last spoke. A lone agent says one
+  thing and then waits. Two agents answer each other until you stop them.
+
+They keep going until you press **Stop**, and nothing else stops them - not
+agreement, not everyone having voted. A room that halted on first agreement
+would hide the thing it exists to show, which is whether agreement *survives*
+more discussion. Every message is real usage on your subscription, so what each
+agent is doing is on screen rather than capped behind your back.
 
 ## Your response is one of six
 
@@ -113,6 +122,26 @@ how a room agrees to something nobody chose.
 different facts: one says the room has not decided, the other says it decided
 against. A UI that renders the first as the second has made a claim the room
 never made.
+
+## What it dogfoods
+
+Both packages, used the way a third-party developer would use them - no bridge,
+no sidecar:
+
+- **`prism-acp`** drives each agent over the CLI you have already signed in to,
+  and streams `agent_message_chunk` straight into the room. That streaming is
+  the whole UX: the transport had been emitting those chunks all along and this
+  app used to accumulate them and post the finished reply, throwing away the one
+  thing a chat room needs.
+- **`prism-harness`** holds each agent's session, keyed on **participant +
+  scope** - the agent's id and the room's. It remembers the CLI session id, so a
+  restarted room resumes each agent's own conversation instead of starting it
+  fresh while the transcript implies continuity.
+
+The harness refused the first configuration offered to it, and was right to: a
+memory-backed store in the *durable* slot throws `volatileDurableStore`, because
+losing durable state is a correctness failure and not a cache miss. The
+in-memory fallback was the bug that looks like a convenience.
 
 ## License
 

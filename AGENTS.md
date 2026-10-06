@@ -40,26 +40,60 @@ work" but **"can anyone else do it as them?"** The answers that matter:
   mechanism. G-36 is the precedent: it fell to a single trailing space in three
   languages at once.
 
-## Go stops for nothing but Stop
+## There are no turns, and that is structural
 
-`DiscussionLoop` runs rounds until the human stops it. Not until consensus, not
-until everyone has voted, not until a round changes nothing — a room that
-halted on first agreement would hide whether agreement SURVIVES discussion.
+`AgentPresence` is ONE LOOP PER AGENT. Nothing schedules them, nothing counts
+rounds, and there is no object representing "the room's turn". If you find
+yourself adding one, the thing you are about to build is the design this
+replaced.
 
-Two bounds exist and neither is a disguised stop: a short pause between rounds,
-which is what makes Stop land in a second rather than at the mercy of a turn;
-and a backoff after a round in which EVERY agent failed, because spinning on
-failure is not discussion. One failing agent among several is a normal round.
+Each agent observes three facts and decides for itself:
+
+**The quiet period** - `QUIET_MS` = 2000, measured from the last COMMITTED
+message, not from a tick. New traffic pushes the deadline out, so an agent
+answers a settled room instead of interrupting. It also stops the loops
+re-synchronising: a fixed sleep would wake every agent together two seconds
+after a message and have them all speak at once, which is rounds again arrived
+at sideways.
+
+**The floor** - one speaker at a time, held in the Room. Several agents
+streaming at once produces interleaved half-sentences nobody can read. Each
+agent observes it and waits; it is a fact, not a turn handed out. Only the floor
+holder may `appendSpeech`, and that is a security property rather than
+bookkeeping: without it any participant could append to another's live message
+and have the words committed under their name.
+
+**Something new to answer** - an agent speaks only when `room.messages.length`
+has moved past what it last saw. A lone agent therefore says one thing and then
+waits, and BOTH halves of that are asserted. A test that used one agent and
+expected it to keep going was the test being wrong, not the code.
+
+Plus jitter before reaching for the floor, which is not decoration: without it
+two agents whose quiet periods expire in the same millisecond race every time
+and the same one always wins, so one agent would dominate for a reason unrelated
+to what it had to say. Re-check the floor AFTER the jitter - acting on a stale
+observation is how two agents end up speaking together.
 
 **Stop kills in-flight turns rather than draining them.** Draining a room of
 several agents is tens of seconds of paid work after the human asked it to end,
 and a Stop button that takes half a minute reads as broken, which invites a
-second press. An aborted turn records NOTHING — half a contribution would put
-words in an agent's mouth it had not finished saying — and an aborted round is
-not counted, because counting it would claim work that was cancelled.
+second press. An aborted turn records NOTHING - half a contribution would put
+words in an agent's mouth it had not finished saying. `stop()` is awaited, so
+the HTTP response means every agent HAS stopped, and the floor is released on
+the way out or the room would look permanently busy.
 
-`stop()` is awaited, so the HTTP response means it has stopped rather than that
-the request was heard.
+## Live text, and why `state` and `live` are different events
+
+Chunks stream into `Room.beginSpeaking` / `appendSpeech` and the surface renders
+a message that is still being written. Committed in ONE step via
+`finishSpeaking(by, finalText)` with the vote line stripped - abandoning and
+re-posting would make the message visibly vanish and reappear in front of
+somebody watching it.
+
+Two SSE event types because they cost different amounts: `state` is the whole
+room on a structural change; `live` is only the message being typed and arrives
+per token. Sending the full transcript per token would make a long room
+quadratic in its own length.
 
 ## The human's six responses are a closed set
 
