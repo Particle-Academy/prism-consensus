@@ -45,8 +45,28 @@ jobs:
       # was already true and invisible, because the sibling tree had been built
       # by its own gates; here it surfaced as the same "Cannot find module" the
       # previous fix was supposed to have solved.
+      # The harness holds per-agent session state; the transport drives the
+      # agents. Both are `file:` dependencies on paths INSIDE this repo, filled
+      # by `npm run link:acp` locally and by these checkouts here.
+      - name: Fetch the harness this app dogfoods
+        uses: actions/checkout@v4
+        with:
+          repository: Particle-Academy/prism-harness-ts
+          path: vendor/prism-harness
+          persist-credentials: false
+
       - name: Build the transport
         working-directory: vendor/prism-acp
+        run: |
+          npm ci
+          npm run build
+
+      # Built for the same reason as the transport: a `file:` dependency on a
+      # source repository resolves its entry point and types from `dist/`,
+      # which is generated and gitignored, so a fresh checkout has the source
+      # and nothing to import.
+      - name: Build the harness
+        working-directory: vendor/prism-harness
         run: |
           npm ci
           npm run build
