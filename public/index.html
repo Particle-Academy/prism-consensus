@@ -1,0 +1,341 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Consensus room</title>
+    <style>
+      :root {
+        --bg: #faf9f7;
+        --fg: #1b1a17;
+        --muted: #6a675f;
+        --line: #e2ded6;
+        --card: #fff;
+        --human: #1f5f8b;
+        --agent: #6b4b8a;
+                --agree-ok: #1d6b3d;
+        --no: #a8352b;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root:not([data-theme='light']) {
+          --bg: #16150f;
+          --fg: #efece4;
+          --muted: #a39f94;
+          --line: #322f26;
+          --card: #1e1d16;
+          --human: #7cb8dd;
+          --agent: #b795d8;
+          --agree-ok: #74c48f;
+          --no: #e5897e;
+        }
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        padding-block: 24px;
+        padding-inline: 16px;
+        background: var(--bg);
+        color: var(--fg);
+        font: 15px/1.55 ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+      }
+      main { max-width: 820px; margin: 0 auto; }
+      h1 { font-size: 20px; margin: 0 0 4px; letter-spacing: -0.01em; }
+      .sub { color: var(--muted); font-size: 13px; margin: 0 0 20px; }
+      section {
+        background: var(--card);
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        padding: 14px 16px;
+        margin-bottom: 14px;
+      }
+      h2 { font-size: 13px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); margin: 0 0 10px; }
+      label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 4px; }
+      input[type='text'], textarea {
+        width: 100%;
+        padding: 8px 10px;
+        border: 1px solid var(--line);
+        border-radius: 7px;
+        background: var(--bg);
+        color: var(--fg);
+        font: inherit;
+      }
+      textarea { min-height: 64px; resize: vertical; }
+      .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: flex-end; }
+      .row > * { flex: 1 1 180px; }
+      button {
+        padding: 8px 14px;
+        border: 1px solid var(--line);
+        border-radius: 7px;
+        background: var(--fg);
+        color: var(--bg);
+        font: inherit;
+        font-weight: 600;
+        cursor: pointer;
+        flex: 0 0 auto;
+      }
+      button.ghost { background: transparent; color: var(--fg); font-weight: 500; }
+      button:disabled { opacity: 0.45; cursor: not-allowed; }
+      .who { font-weight: 650; }
+      .who.human { color: var(--human); }
+      .who.agent { color: var(--agent); }
+      .msg { padding: 9px 0; border-bottom: 1px solid var(--line); }
+      .msg:last-child { border-bottom: 0; }
+      .msg .text { white-space: pre-wrap; }
+      .msg.thought { color: var(--muted); font-style: italic; font-size: 14px; }
+      .msg.thought .text::before { content: 'thinking — '; font-style: normal; font-size: 12px; text-transform: uppercase; letter-spacing: 0.05em; }
+      .pill {
+        display: inline-block;
+        font-size: 12px;
+        padding: 2px 8px;
+        border-radius: 999px;
+        border: 1px solid var(--line);
+        color: var(--muted);
+      }
+      .pill.agree { color: var(--agree-ok); border-color: currentColor; }
+      .pill.disagree { color: var(--no); border-color: currentColor; }
+      table { width: 100%; border-collapse: collapse; font-size: 14px; }
+      th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); }
+      th { font-size: 12px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); font-weight: 600; }
+      .verdict { font-size: 17px; font-weight: 650; }
+      .verdict .unknown { color: var(--muted); font-weight: 500; font-size: 15px; }
+      .err { color: var(--no); font-size: 13px; min-height: 18px; }
+      .scroll { overflow-x: auto; }
+      [hidden] { display: none !important; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Consensus room</h1>
+      <p class="sub">
+        Several agents and you discuss one question and vote. Each agent runs in its own
+        session through <code>prism-acp</code>, over the CLI you already signed in to.
+      </p>
+
+      <section id="setup">
+        <h2>Open a room</h2>
+        <div class="row">
+          <div>
+            <label for="yourName">Your name</label>
+            <input id="yourName" type="text" value="You" />
+          </div>
+          <button id="create">Open room</button>
+        </div>
+        <p class="err" id="setupErr"></p>
+      </section>
+
+      <section id="roster" hidden>
+        <h2>Who is in the room</h2>
+        <table>
+          <thead>
+            <tr><th>Name</th><th>Kind</th><th>Vote</th><th>Reason</th></tr>
+          </thead>
+          <tbody id="rosterBody"></tbody>
+        </table>
+        <div class="row" style="margin-top: 12px">
+          <div>
+            <label for="agentName">Add an agent</label>
+            <input id="agentName" type="text" placeholder="Ada" />
+          </div>
+          <button id="addAgent" class="ghost">Add agent</button>
+        </div>
+      </section>
+
+      <section id="questionBox" hidden>
+        <h2>The question</h2>
+        <div id="questionSet" hidden><p id="questionText" style="margin: 0; font-weight: 600"></p></div>
+        <div id="questionForm">
+          <label for="question">Only you can set this, and only once</label>
+          <textarea id="question" placeholder="Should we adopt ACP as the wire format?"></textarea>
+          <div class="row" style="margin-top: 8px">
+            <span></span><button id="seed">Seed question</button>
+          </div>
+        </div>
+      </section>
+
+      <section id="talk" hidden>
+        <h2>Discussion</h2>
+        <div id="transcript"><p class="sub" style="margin: 0">Nobody has spoken yet.</p></div>
+        <div style="margin-top: 12px">
+          <label for="say">Say something</label>
+          <textarea id="say" placeholder="What matters most here is…"></textarea>
+          <div class="row" style="margin-top: 8px">
+            <span></span>
+            <button id="sayBtn" class="ghost">Send</button>
+            <button id="round">Run a round</button>
+          </div>
+        </div>
+        <p class="err" id="talkErr"></p>
+      </section>
+
+      <section id="voteBox" hidden>
+        <h2>Your vote</h2>
+        <label for="reason">Why (optional)</label>
+        <input id="reason" type="text" placeholder="because the ports already prove it" />
+        <div class="row" style="margin-top: 8px">
+          <span></span>
+          <button data-choice="agree">Agree</button>
+          <button data-choice="disagree" class="ghost">Disagree</button>
+          <button data-choice="abstain" class="ghost">Abstain</button>
+        </div>
+      </section>
+
+      <section id="result" hidden>
+        <h2>Consensus</h2>
+        <p class="verdict" id="verdict"></p>
+        <p class="sub" id="tally" style="margin: 0"></p>
+      </section>
+    </main>
+
+    <script type="module">
+      const $ = (id) => document.getElementById(id);
+      let roomId = null;
+
+      async function api(path, body) {
+        const res = await fetch(path, {
+          method: body === undefined ? 'GET' : 'POST',
+          headers: body === undefined ? {} : { 'content-type': 'application/json' },
+          body: body === undefined ? undefined : JSON.stringify(body),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.error ?? `request failed (${res.status})`);
+        return data;
+      }
+
+      function show(state) {
+        for (const id of ['roster', 'questionBox', 'talk', 'result']) $(id).hidden = false;
+        $('voteBox').hidden = state.question === null;
+
+        $('questionSet').hidden = state.question === null;
+        $('questionForm').hidden = state.question !== null;
+        $('questionText').textContent = state.question ?? '';
+
+        const voteOf = new Map(state.votes.map((v) => [v.participantId, v]));
+        $('rosterBody').replaceChildren(
+          ...state.participants.map((p) => {
+            const tr = document.createElement('tr');
+            const vote = voteOf.get(p.id);
+            const name = document.createElement('td');
+            name.className = `who ${p.kind}`;
+            name.textContent = p.name;
+            const kind = document.createElement('td');
+            kind.textContent = p.kind;
+            const choice = document.createElement('td');
+            const pill = document.createElement('span');
+            // No vote is shown as "not yet", never as a dash: a dash reads as a
+            // value and this is an absence.
+            pill.className = `pill ${vote ? vote.choice : ''}`;
+            pill.textContent = vote ? vote.choice : 'not yet';
+            choice.append(pill);
+            const why = document.createElement('td');
+            why.textContent = vote?.reason ?? '';
+            tr.append(name, kind, choice, why);
+            return tr;
+          }),
+        );
+
+        if (state.transcript.length === 0) {
+          const p = document.createElement('p');
+          p.className = 'sub';
+          p.style.margin = '0';
+          p.textContent = 'Nobody has spoken yet.';
+          $('transcript').replaceChildren(p);
+        } else {
+          $('transcript').replaceChildren(
+            ...state.transcript.map((line) => {
+              const div = document.createElement('div');
+              div.className = `msg ${line.messageKind}`;
+              const who = document.createElement('span');
+              who.className = `who ${line.kind}`;
+              who.textContent = `${line.name} `;
+              const text = document.createElement('span');
+              text.className = 'text';
+              // textContent, never innerHTML: every word here came from an
+              // agent or a name field, and both are untrusted input.
+              text.textContent = line.text;
+              div.append(who, text);
+              return div;
+            }),
+          );
+        }
+
+        const c = state.consensus;
+        if (c.agreed === null) {
+          $('verdict').innerHTML = '<span class="unknown">Not decided yet</span>';
+        } else {
+          $('verdict').textContent = c.agreed ? 'Agreed' : 'No agreement';
+          $('verdict').style.color = c.agreed ? 'var(--agree-ok)' : 'var(--no)';
+        }
+        const t = c.tally;
+        $('tally').textContent =
+          `${t.agree} agree · ${t.disagree} disagree · ${t.abstain} abstain` +
+          (t.outstanding.length > 0 ? ` · waiting on ${t.outstanding.length}` : '');
+
+        $('round').disabled = state.running;
+        $('round').textContent = state.running ? 'Round running…' : 'Run a round';
+      }
+
+      function stream() {
+        const source = new EventSource(`/api/rooms/${roomId}/events`);
+        source.onmessage = (event) => show(JSON.parse(event.data));
+      }
+
+      async function guard(el, fn) {
+        el.textContent = '';
+        try {
+          await fn();
+        } catch (cause) {
+          el.textContent = cause.message;
+        }
+      }
+
+      $('create').addEventListener('click', () =>
+        guard($('setupErr'), async () => {
+          const created = await api('/api/rooms', { name: $('yourName').value });
+          roomId = created.roomId;
+          $('setup').hidden = true;
+          show(await api(`/api/rooms/${roomId}`));
+          stream();
+        }),
+      );
+
+      $('addAgent').addEventListener('click', () =>
+        guard($('setupErr'), async () => {
+          show(await api(`/api/rooms/${roomId}/agents`, { name: $('agentName').value }));
+          $('agentName').value = '';
+        }),
+      );
+
+      $('seed').addEventListener('click', () =>
+        guard($('talkErr'), async () => {
+          show(await api(`/api/rooms/${roomId}/question`, { question: $('question').value }));
+        }),
+      );
+
+      $('sayBtn').addEventListener('click', () =>
+        guard($('talkErr'), async () => {
+          show(await api(`/api/rooms/${roomId}/say`, { text: $('say').value }));
+          $('say').value = '';
+        }),
+      );
+
+      $('round').addEventListener('click', () =>
+        guard($('talkErr'), async () => {
+          show(await api(`/api/rooms/${roomId}/round`, {}));
+        }),
+      );
+
+      for (const button of document.querySelectorAll('[data-choice]')) {
+        button.addEventListener('click', () =>
+          guard($('talkErr'), async () => {
+            show(
+              await api(`/api/rooms/${roomId}/vote`, {
+                choice: button.dataset.choice,
+                reason: $('reason').value,
+              }),
+            );
+          }),
+        );
+      }
+    </script>
+  </body>
+</html>
