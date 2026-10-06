@@ -73,11 +73,17 @@ export function promptFor(room: Room, me: Participant): string {
     .filter((m) => m.kind === 'message')
     .map((m) => {
       const who = names.get(m.participantId);
-      const label =
-        m.participantId === me.id
-          ? `${who?.name ?? m.participantId} (you)`
-          : `${who?.name ?? m.participantId}${who?.kind === 'human' ? ' (the human)' : ''}`;
-      return `${label}: ${m.text}`;
+      // The ROLE comes first, where a name cannot reach it.
+      //
+      // This used to read `${name} (the human)`, and an agent named literally
+      // `Wish (the human)` produced a line byte-identical to the real human's.
+      // Every other agent then deliberated believing the human had said
+      // something they had not. A trailing marker can be imitated by a name
+      // ending in the same text; a leading one states the fact before the
+      // untrusted part begins.
+      const role = who?.kind === 'human' ? '[human]' : '[agent]';
+      const mine = m.participantId === me.id ? ' (you)' : '';
+      return `${role} ${who?.name ?? m.participantId}${mine}: ${m.text}`;
     })
     .join('\n');
 

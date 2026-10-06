@@ -34,6 +34,7 @@ import { fileURLToPath } from 'node:url';
 import { AgentSeat } from './agents.js';
 import { render } from './conversation.js';
 import { DiscussionLoop } from './loop.js';
+import { sanitiseName } from './names.js';
 import { HUMAN_RESPONSES, RESPONSE_KEYS, humanResponse } from './responses.js';
 import { Principal, Room, RoomError } from './room.js';
 
@@ -140,7 +141,7 @@ export function createConsensusServer(options: ServerOptions = {}) {
       const roomId = `room_${++counter}`;
       const room = new Room(roomId);
       const participantId = 'human';
-      room.join({ id: participantId, kind: 'human', name: nameOf(body.name, 'You') });
+      room.join({ id: participantId, kind: 'human', name: sanitiseName(body.name, 'You') });
 
       const live: Live = { room, seats: [], listeners: new Set(), loop: null };
       rooms.set(roomId, live);
@@ -198,7 +199,7 @@ export function createConsensusServer(options: ServerOptions = {}) {
 
     switch (action) {
       case 'agents': {
-        const name = nameOf(body.name, `Agent ${live.seats.length + 1}`);
+        const name = sanitiseName(body.name, `Agent ${live.seats.length + 1}`);
         const id = `agent_${live.seats.length + 1}`;
         live.room.join({ id, kind: 'agent', name });
         const factory =
@@ -329,10 +330,4 @@ function cookieOf(header: string | undefined, name: string): string | null {
   return null;
 }
 
-function nameOf(value: unknown, fallback: string): string {
-  const name = typeof value === 'string' ? value.trim() : '';
-  // Capped and stripped of control characters: a name is rendered in a page and
-  // fed into an agent's prompt, so it is untrusted on both counts.
-  return (name.length > 0 ? name : fallback).replace(/[\u0000-\u001F\u007F]/g, '').slice(0, 60);
-}
 

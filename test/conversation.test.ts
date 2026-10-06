@@ -127,11 +127,14 @@ describe('promptFor', () => {
     expect(prompt).toContain('Ada (you): I lean yes');
   });
 
-  it('marks which participant is the human', () => {
+  it('marks which participant is the human, with the ROLE FIRST', () => {
+    // Role-first because a trailing marker can be imitated by a name. This read
+    // `Wish (the human):` until an agent named literally `Wish (the human)` was
+    // found to produce a byte-identical line — see adversarial-naming.test.ts.
     const r = room();
     r.say(Principal.authenticated('h1', 'human'), 'What do you think?');
     const prompt = promptFor(r, { id: 'a1', kind: 'agent', name: 'Ada' });
-    expect(prompt).toContain('Wish (the human): What do you think?');
+    expect(prompt).toContain('[human] Wish: What do you think?');
   });
 
   it('asks explicitly for disagreement', () => {

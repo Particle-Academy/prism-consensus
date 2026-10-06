@@ -31,6 +31,8 @@
  * resting on something a caller controls.
  */
 
+import { confusable } from './names.js';
+
 /** Who is in the room. A human and some agents. */
 export type ParticipantKind = 'human' | 'agent';
 
@@ -220,6 +222,19 @@ export class Room {
     // reservation this app demonstrates is about a single human surface.
     if (participant.kind === 'human' && this.participants.some((p) => p.kind === 'human')) {
       throw new RoomError('the room already has a human');
+    }
+
+    // A name a reader cannot tell apart from another is an attribution forgery
+    // waiting to happen: the transcript every agent reads is labelled by name.
+    // Compared in canonical form, so a trailing space, a zero-width character
+    // or a Cyrillic look-alike are all the same name -- the narrow fix would
+    // have closed the ASCII hole and left three Unicode ones, which is exactly
+    // how G-36 happened.
+    const clash = this.participants.find((p) => confusable(p.name, participant.name));
+    if (clash !== undefined) {
+      throw new RoomError(
+        `a participant called "${clash.name}" is already here; "${participant.name}" would be indistinguishable`,
+      );
     }
     this.#participants.set(participant.id, participant);
   }
