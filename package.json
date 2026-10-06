@@ -12,10 +12,11 @@
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
-    "start": "tsc -p tsconfig.json && node dist/main.js"
+    "start": "tsc -p tsconfig.json && node dist/main.js",
+    "link:acp": "node tools/link-acp.mjs"
   },
   "dependencies": {
-    "@particle-academy/prism-acp": "file:../prism-acp-ts"
+    "@particle-academy/prism-acp": "file:vendor/prism-acp"
   },
   "devDependencies": {
     "@types/node": "^26.3.0",

@@ -24,6 +24,21 @@ jobs:
         with:
           node-version: ${{ matrix.node }}
           cache: npm
+      # The app depends on `file:vendor/prism-acp`, a path INSIDE the repo, and
+      # the two environments fill it differently: `npm run link:acp` points it
+      # at the sibling working tree locally, and this checks the package out
+      # into the same place. A dependency path that leaves the repository works
+      # on a developer's machine and cannot work here -- which is exactly how
+      # the first push failed, with every test green locally and
+      # "Cannot find module '@particle-academy/prism-acp'" on all three node
+      # versions.
+      - name: Fetch the transport this app dogfoods
+        uses: actions/checkout@v4
+        with:
+          repository: Particle-Academy/prism-acp-ts
+          path: vendor/prism-acp
+          persist-credentials: false
+
       - run: npm ci
       - run: npm run typecheck
       - run: npm run build

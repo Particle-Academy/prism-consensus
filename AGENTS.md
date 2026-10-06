@@ -62,6 +62,28 @@ nothing else, so there is nothing to ignore. An agent writing
 
 ## Dependencies
 
-`@particle-academy/prism-acp` by `file:` path to the sibling working tree, which
-is this ecosystem's pattern: the testbed builds against the tree, so it tests
-before anything is published. Nothing else at runtime.
+`@particle-academy/prism-acp` and nothing else at runtime.
+
+The dependency path is `file:vendor/prism-acp` — **inside** the repository — and
+the two environments fill it differently:
+
+```sh
+npm run link:acp     # locally: junction to the sibling prism-acp-ts tree
+```
+
+CI checks the package out into the same place. One dependency path, no
+conditional in `package.json`, and the local setup still builds against the
+working tree, which is this ecosystem's pattern: the testbed tests before
+anything is published.
+
+**Why not `file:../prism-acp-ts`.** It works on a developer's machine and cannot
+work in CI, where only this repository is checked out. That is how the first
+push failed: every test green locally, and `Cannot find module
+'@particle-academy/prism-acp'` on all three node versions.
+
+**And why `vitest.config.ts` excludes `vendor/`.** The junction is a real
+directory as far as vitest is concerned, and it walked in: a run reported **246
+tests** where this app has 83, the other 163 being the dependency's own, passing
+under this repo's name. Worse than noise — a transport failure would have failed
+this suite pointing at a file that is not ours, and a green run would have
+claimed coverage of code this app does not own.
